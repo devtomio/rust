@@ -1,4 +1,4 @@
-use std::future::{join, Future};
+use std::future::{Future, join};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake};
@@ -30,7 +30,6 @@ fn poll_n(val: usize, num: usize) -> PollN {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)] // self-referential generators do not work with Miri's aliasing checks
 fn test_join() {
     block_on(async move {
         let x = join!(async { 0 }).await;
@@ -57,7 +56,7 @@ fn test_join() {
 
         let y = String::new();
         let x = join!(async {
-            println!("{}", &y);
+            println!("{y}");
             1
         })
         .await;

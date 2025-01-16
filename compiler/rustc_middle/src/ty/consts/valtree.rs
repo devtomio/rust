@@ -1,9 +1,10 @@
-use super::ScalarInt;
-use crate::mir::interpret::{AllocId, Scalar};
-use crate::ty::{self, Ty, TyCtxt};
 use rustc_macros::{HashStable, TyDecodable, TyEncodable};
 
-#[derive(Copy, Clone, Debug, Hash, TyEncodable, TyDecodable, Eq, PartialEq, Ord, PartialOrd)]
+use super::ScalarInt;
+use crate::mir::interpret::Scalar;
+use crate::ty::{self, Ty, TyCtxt};
+
+#[derive(Copy, Clone, Debug, Hash, TyEncodable, TyDecodable, Eq, PartialEq)]
 #[derive(HashStable)]
 /// This datastructure is used to represent the value of constants used in the type system.
 ///
@@ -18,17 +19,20 @@ use rustc_macros::{HashStable, TyDecodable, TyEncodable};
 /// `ValTree` does not have this problem with representation, as it only contains integers or
 /// lists of (nested) `ValTree`.
 pub enum ValTree<'tcx> {
-    /// ZSTs, integers, `bool`, `char` are represented as scalars.
+    /// integers, `bool`, `char` are represented as scalars.
     /// See the `ScalarInt` documentation for how `ScalarInt` guarantees that equal values
     /// of these types have the same representation.
     Leaf(ScalarInt),
 
     //SliceOrStr(ValSlice<'tcx>),
-    // dont use SliceOrStr for now
+    // don't use SliceOrStr for now
     /// The fields of any kind of aggregate. Structs, tuples and arrays are represented by
     /// listing their fields' values in order.
+    ///
     /// Enums are represented by storing their discriminant as a field, followed by all
     /// the fields of the variant.
+    ///
+    /// ZST types are represented as an empty slice.
     Branch(&'tcx [ValTree<'tcx>]),
 }
 
@@ -64,7 +68,7 @@ impl<'tcx> ValTree<'tcx> {
         Self::Leaf(i)
     }
 
-    pub fn try_to_scalar(self) -> Option<Scalar<AllocId>> {
+    pub fn try_to_scalar(self) -> Option<Scalar> {
         self.try_to_scalar_int().map(Scalar::Int)
     }
 
@@ -75,8 +79,8 @@ impl<'tcx> ValTree<'tcx> {
         }
     }
 
-    pub fn try_to_machine_usize(self, tcx: TyCtxt<'tcx>) -> Option<u64> {
-        self.try_to_scalar_int().map(|s| s.try_to_machine_usize(tcx).ok()).flatten()
+    pub fn try_to_target_usize(self, tcx: TyCtxt<'tcx>) -> Option<u64> {
+        self.try_to_scalar_int().map(|s| s.to_target_usize(tcx))
     }
 
     /// Get the values inside the ValTree as a slice of bytes. This only works for
@@ -97,8 +101,9 @@ impl<'tcx> ValTree<'tcx> {
             _ => return None,
         }
 
-        Some(tcx.arena.alloc_from_iter(
-            self.unwrap_branch().into_iter().map(|v| v.unwrap_leaf().try_to_u8().unwrap()),
-        ))
+        Some(
+            tcx.arena
+                .alloc_from_iter(self.unwrap_branch().into_iter().map(|v| v.unwrap_leaf().to_u8())),
+        )
     }
 }

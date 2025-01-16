@@ -1,7 +1,6 @@
-use core::{
-    cell::{Cell, LazyCell, OnceCell},
-    sync::atomic::{AtomicUsize, Ordering::SeqCst},
-};
+use core::cell::{Cell, LazyCell, OnceCell};
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering::SeqCst;
 
 #[test]
 fn once_cell() {
@@ -10,7 +9,7 @@ fn once_cell() {
     c.get_or_init(|| 92);
     assert_eq!(c.get(), Some(&92));
 
-    c.get_or_init(|| panic!("Kabom!"));
+    c.get_or_init(|| panic!("Kaboom!"));
     assert_eq!(c.get(), Some(&92));
 }
 
@@ -46,11 +45,13 @@ fn unsync_once_cell_drop_empty() {
     drop(x);
 }
 
+/* FIXME(#110395)
 #[test]
 const fn once_cell_const() {
     let _once_cell: OnceCell<u32> = OnceCell::new();
     let _once_cell: OnceCell<u32> = OnceCell::from(32);
 }
+*/
 
 #[test]
 fn clone() {
@@ -104,6 +105,34 @@ fn lazy_new() {
     let y = *x - 30;
     assert_eq!(y, 62);
     assert_eq!(called.get(), 1);
+}
+
+// Check that we can infer `T` from closure's type.
+#[test]
+fn lazy_type_inference() {
+    let _ = LazyCell::new(|| ());
+}
+
+#[test]
+#[cfg(panic = "unwind")]
+#[should_panic = "LazyCell instance has previously been poisoned"]
+fn lazy_force_mut_panic() {
+    let mut lazy = LazyCell::<String>::new(|| panic!());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = LazyCell::force_mut(&mut lazy);
+    }))
+    .unwrap_err();
+    let _ = &*lazy;
+}
+
+#[test]
+fn lazy_force_mut() {
+    let s = "abc".to_owned();
+    let mut lazy = LazyCell::new(move || s);
+    LazyCell::force_mut(&mut lazy);
+    let p = LazyCell::force_mut(&mut lazy);
+    p.clear();
+    LazyCell::force_mut(&mut lazy);
 }
 
 #[test]

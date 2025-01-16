@@ -24,7 +24,7 @@ pub struct Baz;
             foo: t
 
             crate::foo
-            Baz: t v
+            Baz: ti vi
             Foo: t v
             bar: t
 
@@ -119,7 +119,7 @@ use foo::*;
 use foo::bar::*;
 
 //- /foo/mod.rs
-mod bar;
+pub mod bar;
 fn Foo() {};
 pub struct Foo {};
 
@@ -132,6 +132,7 @@ pub(crate) struct PubCrateStruct;
             crate
             Foo: t
             PubCrateStruct: t v
+            bar: t
             foo: t
 
             crate::foo
@@ -236,9 +237,9 @@ pub mod baz { pub struct Bar; }
 "#,
         expect![[r#"
             crate
-            Bar: t v
+            Bar: ti vi
             bar: t
-            baz: t
+            baz: ti
             foo: t
 
             crate::bar
@@ -275,9 +276,9 @@ pub mod baz { pub struct Bar; }
 "#,
         expect![[r#"
             crate
-            Bar: t v
+            Bar: ti vi
             bar: t
-            baz: t
+            baz: ti
             foo: t
 
             crate::bar
@@ -322,7 +323,7 @@ mod d {
             X: t v
 
             crate::b
-            foo: t
+            foo: ti
 
             crate::c
             foo: t
@@ -331,8 +332,161 @@ mod d {
             Y: t v
 
             crate::d
-            Y: t v
-            foo: t
+            Y: ti vi
+            foo: ti
+        "#]],
+    );
+}
+
+#[test]
+fn glob_name_collision_check_visibility() {
+    check(
+        r#"
+mod event {
+    mod serenity {
+        pub fn Event() {}
+    }
+    use serenity::*;
+
+    pub struct Event {}
+}
+
+use event::Event;
+        "#,
+        expect![[r#"
+            crate
+            Event: ti
+            event: t
+
+            crate::event
+            Event: t v
+            serenity: t
+
+            crate::event::serenity
+            Event: v
+        "#]],
+    );
+}
+
+#[test]
+fn glob_may_override_visibility() {
+    check(
+        r#"
+mod reexport {
+    use crate::defs::*;
+    mod inner {
+        pub use crate::defs::{Trait, function, makro};
+    }
+    pub use inner::*;
+}
+mod defs {
+    pub trait Trait {}
+    pub fn function() {}
+    pub macro makro($t:item) { $t }
+}
+use reexport::*;
+"#,
+        expect![[r#"
+            crate
+            Trait: t
+            defs: t
+            function: v
+            makro: m
+            reexport: t
+
+            crate::defs
+            Trait: t
+            function: v
+            makro: m
+
+            crate::reexport
+            Trait: t
+            function: v
+            inner: t
+            makro: m
+
+            crate::reexport::inner
+            Trait: ti
+            function: vi
+            makro: mi
+        "#]],
+    );
+}
+
+#[test]
+fn regression_18308() {
+    check(
+        r#"
+use outer::*;
+
+mod outer {
+    mod inner_superglob {
+        pub use super::*;
+    }
+
+    // The importing order matters!
+    pub use inner_superglob::*;
+    use super::glob_target::*;
+}
+
+mod glob_target {
+    pub struct ShouldBePrivate;
+}
+"#,
+        expect![[r#"
+            crate
+            glob_target: t
+            outer: t
+
+            crate::glob_target
+            ShouldBePrivate: t v
+
+            crate::outer
+            ShouldBePrivate: t v
+            inner_superglob: t
+
+            crate::outer::inner_superglob
+            ShouldBePrivate: t v
+            inner_superglob: t
+        "#]],
+    );
+}
+
+#[test]
+fn regression_18580() {
+    check(
+        r#"
+pub mod libs {
+    pub struct Placeholder;
+}
+
+pub mod reexport_2 {
+    use reexport_1::*;
+    pub use reexport_1::*;
+
+    pub mod reexport_1 {
+        pub use crate::libs::*;
+    }
+}
+
+use reexport_2::*;
+"#,
+        expect![[r#"
+            crate
+            Placeholder: t v
+            libs: t
+            reexport_1: t
+            reexport_2: t
+
+            crate::libs
+            Placeholder: t v
+
+            crate::reexport_2
+            Placeholder: t v
+            reexport_1: t
+
+            crate::reexport_2::reexport_1
+            Placeholder: t v
         "#]],
     );
 }

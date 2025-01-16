@@ -5,10 +5,9 @@
 //! - Provide helpers for `report-time` and `measure-time` options.
 //! - Provide newtypes for executions times.
 
-use std::env;
-use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+use std::{env, fmt};
 
 use super::types::{TestDesc, TestType};
 
@@ -24,8 +23,9 @@ pub const TEST_WARN_TIMEOUT_S: u64 = 60;
 /// Example of the expected format is `RUST_TEST_TIME_xxx=100,200`, where 100 means
 /// warn time, and 200 means critical time.
 pub mod time_constants {
-    use super::TEST_WARN_TIMEOUT_S;
     use std::time::Duration;
+
+    use super::TEST_WARN_TIMEOUT_S;
 
     /// Environment variable for overriding default threshold for unit-tests.
     pub const UNIT_ENV_NAME: &str = "RUST_TEST_TIME_UNIT";
@@ -107,16 +107,14 @@ impl TimeThreshold {
         let durations_str = env::var(env_var_name).ok()?;
         let (warn_str, critical_str) = durations_str.split_once(',').unwrap_or_else(|| {
             panic!(
-                "Duration variable {} expected to have 2 numbers separated by comma, but got {}",
-                env_var_name, durations_str
+                "Duration variable {env_var_name} expected to have 2 numbers separated by comma, but got {durations_str}"
             )
         });
 
         let parse_u64 = |v| {
             u64::from_str(v).unwrap_or_else(|_| {
                 panic!(
-                    "Duration value in variable {} is expected to be a number, but got {}",
-                    env_var_name, v
+                    "Duration value in variable {env_var_name} is expected to be a number, but got {v}"
                 )
             })
         };

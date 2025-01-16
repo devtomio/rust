@@ -1,12 +1,11 @@
-// run-rustfix
-
 #![warn(clippy::manual_bits)]
 #![allow(
     clippy::no_effect,
     clippy::useless_conversion,
     path_statements,
     unused_must_use,
-    clippy::unnecessary_operation
+    clippy::unnecessary_operation,
+    clippy::unnecessary_cast
 )]
 
 use std::mem::{size_of, size_of_val};
@@ -56,4 +55,15 @@ fn main() {
     let _: u32 = (size_of::<u128>() * 8).try_into().unwrap();
     let _ = (size_of::<u128>() * 8).pow(5);
     let _ = &(size_of::<u128>() * 8);
+}
+
+fn should_not_lint() {
+    macro_rules! bits_via_macro {
+        ($T: ty) => {
+            size_of::<$T>() * 8;
+        };
+    }
+
+    bits_via_macro!(u8);
+    bits_via_macro!(String);
 }

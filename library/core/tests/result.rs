@@ -96,15 +96,6 @@ fn test_unwrap_or() {
 }
 
 #[test]
-fn test_ok_or_err() {
-    let ok: Result<isize, isize> = Ok(100);
-    let err: Result<isize, isize> = Err(200);
-
-    assert_eq!(ok.into_ok_or_err(), 100);
-    assert_eq!(err.into_ok_or_err(), 200);
-}
-
-#[test]
 fn test_unwrap_or_else() {
     fn handler(msg: &'static str) -> isize {
         if msg == "I got this." { 50 } else { panic!("BadBad") }
@@ -179,6 +170,7 @@ pub fn test_iter() {
 }
 
 #[test]
+#[allow(for_loops_over_fallibles)]
 pub fn test_iter_mut() {
     let mut ok: Result<isize, &'static str> = Ok(100);
     for loc in ok.iter_mut() {
@@ -204,6 +196,7 @@ pub fn test_unwrap_or_default() {
 }
 
 #[test]
+#[allow(non_local_definitions)]
 pub fn test_into_ok() {
     fn infallible_op() -> Result<isize, !> {
         Ok(666)
@@ -226,6 +219,7 @@ pub fn test_into_ok() {
 }
 
 #[test]
+#[allow(non_local_definitions)]
 pub fn test_into_err() {
     fn until_error_op() -> Result<!, isize> {
         Err(666)
@@ -415,13 +409,15 @@ fn result_opt_conversions() {
 
 #[test]
 fn result_try_trait_v2_branch() {
-    use core::num::NonZeroU32;
-    use core::ops::{ControlFlow::*, Try};
+    use core::num::NonZero;
+    use core::ops::ControlFlow::*;
+    use core::ops::Try;
+
     assert_eq!(Ok::<i32, i32>(4).branch(), Continue(4));
     assert_eq!(Err::<i32, i32>(4).branch(), Break(Err(4)));
-    let one = NonZeroU32::new(1).unwrap();
-    assert_eq!(Ok::<(), NonZeroU32>(()).branch(), Continue(()));
-    assert_eq!(Err::<(), NonZeroU32>(one).branch(), Break(Err(one)));
-    assert_eq!(Ok::<NonZeroU32, ()>(one).branch(), Continue(one));
-    assert_eq!(Err::<NonZeroU32, ()>(()).branch(), Break(Err(())));
+    let one = NonZero::new(1).unwrap();
+    assert_eq!(Ok::<(), NonZero<u32>>(()).branch(), Continue(()));
+    assert_eq!(Err::<(), NonZero<u32>>(one).branch(), Break(Err(one)));
+    assert_eq!(Ok::<NonZero<u32>, ()>(one).branch(), Continue(one));
+    assert_eq!(Err::<NonZero<u32>, ()>(()).branch(), Break(Err(())));
 }

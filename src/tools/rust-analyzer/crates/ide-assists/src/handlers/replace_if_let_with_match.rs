@@ -13,11 +13,11 @@ use syntax::{
         edit::{AstNodeEdit, IndentLevel},
         make, HasName,
     },
-    AstNode, TextRange,
+    AstNode, TextRange, T,
 };
 
 use crate::{
-    utils::{does_nested_pattern, does_pat_match_variant, unwrap_trivial_block},
+    utils::{does_pat_match_variant, does_pat_variant_nested_or_literal, unwrap_trivial_block},
     AssistContext, AssistId, AssistKind, Assists,
 };
 
@@ -96,14 +96,17 @@ pub(crate) fn replace_if_let_with_match(acc: &mut Assists, ctx: &AssistContext<'
         cond_bodies.push((cond, body));
     }
 
-    if !pat_seen {
-        // Don't offer turning an if (chain) without patterns into a match
+    if !pat_seen && cond_bodies.len() != 1 {
+        // Don't offer turning an if (chain) without patterns into a match,
+        // unless its a simple `if cond { .. } (else { .. })`
         return None;
     }
 
+    let let_ = if pat_seen { " let" } else { "" };
+
     acc.add(
         AssistId("replace_if_let_with_match", AssistKind::RefactorRewrite),
-        "Replace if let with match",
+        format!("Replace if{let_} with match"),
         available_range,
         move |edit| {
             let match_expr = {
@@ -114,6 +117,11 @@ pub(crate) fn replace_if_let_with_match(acc: &mut Assists, ctx: &AssistContext<'
                         Either::Left(pat) => {
                             make::match_arm(iter::once(pat), None, unwrap_trivial_block(body))
                         }
+                        Either::Right(_) if !pat_seen => make::match_arm(
+                            iter::once(make::literal_pat("true").into()),
+                            None,
+                            unwrap_trivial_block(body),
+                        ),
                         Either::Right(expr) => make::match_arm(
                             iter::once(make::wildcard_pat().into()),
                             Some(expr),
@@ -127,7 +135,7 @@ pub(crate) fn replace_if_let_with_match(acc: &mut Assists, ctx: &AssistContext<'
             };
 
             let has_preceding_if_expr =
-                if_expr.syntax().parent().map_or(false, |it| ast::IfExpr::can_cast(it.kind()));
+                if_expr.syntax().parent().is_some_and(|it| ast::IfExpr::can_cast(it.kind()));
             let expr = if has_preceding_if_expr {
                 // make sure we replace the `else if let ...` with a block so we don't end up with `else expr`
                 make::block_expr(None, Some(match_expr)).into()
@@ -144,31 +152,36 @@ fn make_else_arm(
     else_block: Option<ast::BlockExpr>,
     conditionals: &[(Either<ast::Pat, ast::Expr>, ast::BlockExpr)],
 ) -> ast::MatchArm {
-    if let Some(else_block) = else_block {
-        let pattern = if let [(Either::Left(pat), _)] = conditionals {
-            ctx.sema
+    let (pattern, expr) = if let Some(else_block) = else_block {
+        let pattern = match conditionals {
+            [(Either::Right(_), _)] => make::literal_pat("false").into(),
+            [(Either::Left(pat), _)] => match ctx
+                .sema
                 .type_of_pat(pat)
                 .and_then(|ty| TryEnum::from_ty(&ctx.sema, &ty.adjusted()))
-                .zip(Some(pat))
-        } else {
-            None
-        };
-        let pattern = match pattern {
-            Some((it, pat)) => {
-                if does_pat_match_variant(pat, &it.sad_pattern()) {
-                    it.happy_pattern_wildcard()
-                } else if does_nested_pattern(pat) {
-                    make::wildcard_pat().into()
-                } else {
-                    it.sad_pattern()
+            {
+                Some(it) => {
+                    if does_pat_match_variant(pat, &it.sad_pattern()) {
+                        it.happy_pattern_wildcard()
+                    } else if does_pat_variant_nested_or_literal(ctx, pat) {
+                        make::wildcard_pat().into()
+                    } else {
+                        it.sad_pattern()
+                    }
                 }
-            }
-            None => make::wildcard_pat().into(),
+                None => make::wildcard_pat().into(),
+            },
+            _ => make::wildcard_pat().into(),
         };
-        make::match_arm(iter::once(pattern), None, unwrap_trivial_block(else_block))
+        (pattern, unwrap_trivial_block(else_block))
     } else {
-        make::match_arm(iter::once(make::wildcard_pat().into()), None, make::expr_unit())
-    }
+        let pattern = match conditionals {
+            [(Either::Right(_), _)] => make::literal_pat("false").into(),
+            _ => make::wildcard_pat().into(),
+        };
+        (pattern, make::expr_unit())
+    };
+    make::match_arm(iter::once(pattern), None, expr)
 }
 
 // Assist: replace_match_with_if_let
@@ -199,8 +212,17 @@ fn make_else_arm(
 // ```
 pub(crate) fn replace_match_with_if_let(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let match_expr: ast::MatchExpr = ctx.find_node_at_offset()?;
+    let match_arm_list = match_expr.match_arm_list()?;
+    let available_range = TextRange::new(
+        match_expr.syntax().text_range().start(),
+        match_arm_list.syntax().text_range().start(),
+    );
+    let cursor_in_range = available_range.contains_range(ctx.selection_trimmed());
+    if !cursor_in_range {
+        return None;
+    }
 
-    let mut arms = match_expr.match_arm_list()?.arms();
+    let mut arms = match_arm_list.arms();
     let (first_arm, second_arm) = (arms.next()?, arms.next()?);
     if arms.next().is_some() || first_arm.guard().is_some() || second_arm.guard().is_some() {
         return None;
@@ -215,10 +237,20 @@ pub(crate) fn replace_match_with_if_let(acc: &mut Assists, ctx: &AssistContext<'
     )?;
     let scrutinee = match_expr.expr()?;
 
+    let let_ = match &if_let_pat {
+        ast::Pat::LiteralPat(p)
+            if p.literal()
+                .map(|it| it.token().kind())
+                .is_some_and(|it| it == T![true] || it == T![false]) =>
+        {
+            ""
+        }
+        _ => " let",
+    };
     let target = match_expr.syntax().text_range();
     acc.add(
         AssistId("replace_match_with_if_let", AssistKind::RefactorRewrite),
-        "Replace match with if let",
+        format!("Replace match with if{let_}"),
         target,
         move |edit| {
             fn make_block_expr(expr: ast::Expr) -> ast::BlockExpr {
@@ -231,11 +263,23 @@ pub(crate) fn replace_match_with_if_let(acc: &mut Assists, ctx: &AssistContext<'
                 }
             }
 
-            let condition = make::expr_let(if_let_pat, scrutinee);
+            let condition = match if_let_pat {
+                ast::Pat::LiteralPat(p)
+                    if p.literal().is_some_and(|it| it.token().kind() == T![true]) =>
+                {
+                    scrutinee
+                }
+                ast::Pat::LiteralPat(p)
+                    if p.literal().is_some_and(|it| it.token().kind() == T![false]) =>
+                {
+                    make::expr_prefix(T![!], scrutinee)
+                }
+                _ => make::expr_let(if_let_pat, scrutinee).into(),
+            };
             let then_block = make_block_expr(then_expr.reset_indent());
             let else_expr = if is_empty_expr(&else_expr) { None } else { Some(else_expr) };
             let if_let_expr = make::expr_if(
-                condition.into(),
+                condition,
                 then_block,
                 else_expr.map(make_block_expr).map(ast::ElseBranch::Block),
             )
@@ -295,10 +339,10 @@ fn binds_name(sema: &hir::Semantics<'_, RootDatabase>, pat: &ast::Pat) -> bool {
         ast::Pat::TupleStructPat(it) => it.fields().any(binds_name_v),
         ast::Pat::RecordPat(it) => it
             .record_pat_field_list()
-            .map_or(false, |rpfl| rpfl.fields().flat_map(|rpf| rpf.pat()).any(binds_name_v)),
-        ast::Pat::RefPat(pat) => pat.pat().map_or(false, binds_name_v),
-        ast::Pat::BoxPat(pat) => pat.pat().map_or(false, binds_name_v),
-        ast::Pat::ParenPat(pat) => pat.pat().map_or(false, binds_name_v),
+            .is_some_and(|rpfl| rpfl.fields().flat_map(|rpf| rpf.pat()).any(binds_name_v)),
+        ast::Pat::RefPat(pat) => pat.pat().is_some_and(binds_name_v),
+        ast::Pat::BoxPat(pat) => pat.pat().is_some_and(binds_name_v),
+        ast::Pat::ParenPat(pat) => pat.pat().is_some_and(binds_name_v),
         _ => false,
     }
 }
@@ -306,7 +350,7 @@ fn binds_name(sema: &hir::Semantics<'_, RootDatabase>, pat: &ast::Pat) -> bool {
 fn is_sad_pat(sema: &hir::Semantics<'_, RootDatabase>, pat: &ast::Pat) -> bool {
     sema.type_of_pat(pat)
         .and_then(|ty| TryEnum::from_ty(sema, &ty.adjusted()))
-        .map_or(false, |it| does_pat_match_variant(pat, &it.sad_pattern()))
+        .is_some_and(|it| does_pat_match_variant(pat, &it.sad_pattern()))
 }
 
 #[cfg(test)]
@@ -316,12 +360,64 @@ mod tests {
     use crate::tests::{check_assist, check_assist_not_applicable, check_assist_target};
 
     #[test]
-    fn test_if_let_with_match_unapplicable_for_simple_ifs() {
+    fn test_if_let_with_match_inapplicable_for_simple_ifs() {
         check_assist_not_applicable(
             replace_if_let_with_match,
             r#"
 fn main() {
     if $0true {} else if false {} else {}
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn test_if_with_match_no_else() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+pub fn foo(foo: bool) {
+    if foo$0 {
+        self.foo();
+    }
+}
+"#,
+            r#"
+pub fn foo(foo: bool) {
+    match foo {
+        true => {
+            self.foo();
+        }
+        false => (),
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn test_if_with_match_with_else() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+pub fn foo(foo: bool) {
+    if foo$0 {
+        self.foo();
+    } else {
+        self.bar();
+    }
+}
+"#,
+            r#"
+pub fn foo(foo: bool) {
+    match foo {
+        true => {
+            self.foo();
+        }
+        false => {
+            self.bar();
+        }
+    }
 }
 "#,
         )
@@ -606,11 +702,11 @@ fn main() {
     }
 
     #[test]
-    fn nested_type() {
+    fn test_if_let_with_match_nested_tuple_struct() {
         check_assist(
             replace_if_let_with_match,
             r#"
-//- minicore: result
+//- minicore: result, option
 fn foo(x: Result<i32, ()>) {
     let bar: Result<_, ()> = Ok(Some(1));
     $0if let Ok(Some(_)) = bar {
@@ -626,6 +722,700 @@ fn foo(x: Result<i32, ()>) {
     match bar {
         Ok(Some(_)) => (),
         _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+struct MyStruct(i32, i32);
+fn foo(x: Result<MyStruct, ()>) {
+    let bar: Result<MyStruct, ()> = Ok(MyStruct(1, 2));
+    $0if let Ok(MyStruct(a, b)) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+struct MyStruct(i32, i32);
+fn foo(x: Result<MyStruct, ()>) {
+    let bar: Result<MyStruct, ()> = Ok(MyStruct(1, 2));
+    match bar {
+        Ok(MyStruct(a, b)) => (),
+        Err(_) => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_slice() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<&[i32], ()>) {
+    let foo: Result<&[_], ()> = Ok(&[0, 1, 2]);
+    $0if let Ok([]) = foo {
+        ()
+    } else {
+        ()
+    }
+}
+        "#,
+            r#"
+fn foo(x: Result<&[i32], ()>) {
+    let foo: Result<&[_], ()> = Ok(&[0, 1, 2]);
+    match foo {
+        Ok([]) => (),
+        _ => (),
+    }
+}
+        "#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<[&'static str; 2], ()>) {
+    let foobar: Result<_, ()> = Ok(["foo", "bar"]);
+    $0if let Ok([_, "bar"]) = foobar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<[&'static str; 2], ()>) {
+    let foobar: Result<_, ()> = Ok(["foo", "bar"]);
+    match foobar {
+        Ok([_, "bar"]) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<[&'static str; 2], ()>) {
+    let foobar: Result<_, ()> = Ok(["foo", "bar"]);
+    $0if let Ok([..]) = foobar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<[&'static str; 2], ()>) {
+    let foobar: Result<_, ()> = Ok(["foo", "bar"]);
+    match foobar {
+        Ok([..]) => (),
+        Err(_) => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<&[&'static str], ()>) {
+    let foobar: Result<&[&'static str], ()> = Ok(&["foo", "bar"]);
+    $0if let Ok([a, ..]) = foobar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<&[&'static str], ()>) {
+    let foobar: Result<&[&'static str], ()> = Ok(&["foo", "bar"]);
+    match foobar {
+        Ok([a, ..]) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<&[&'static str], ()>) {
+    let foobar: Result<&[&'static str], ()> = Ok(&["foo", "bar"]);
+    $0if let Ok([a, .., b, c]) = foobar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<&[&'static str], ()>) {
+    let foobar: Result<&[&'static str], ()> = Ok(&["foo", "bar"]);
+    match foobar {
+        Ok([a, .., b, c]) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<Option<[&'static str; 2]>, ()>) {
+    let foobar: Result<_, ()> = Ok(Some(["foo", "bar"]));
+    $0if let Ok(Some([_, "bar"])) = foobar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<Option<[&'static str; 2]>, ()>) {
+    let foobar: Result<_, ()> = Ok(Some(["foo", "bar"]));
+    match foobar {
+        Ok(Some([_, "bar"])) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_literal() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<&'static str, ()>) {
+    let bar: Result<&_, ()> = Ok("bar");
+    $0if let Ok("foo") = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<&'static str, ()>) {
+    let bar: Result<&_, ()> = Ok("bar");
+    match bar {
+        Ok("foo") => (),
+        _ => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_tuple() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<(i32, i32, i32), ()>) {
+    let bar: Result<(i32, i32, i32), ()> = Ok((1, 2, 3));
+    $0if let Ok((1, second, third)) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<(i32, i32, i32), ()>) {
+    let bar: Result<(i32, i32, i32), ()> = Ok((1, 2, 3));
+    match bar {
+        Ok((1, second, third)) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<(i32, i32, i32), ()>) {
+    let bar: Result<(i32, i32, i32), ()> = Ok((1, 2, 3));
+    $0if let Ok((first, second, third)) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<(i32, i32, i32), ()>) {
+    let bar: Result<(i32, i32, i32), ()> = Ok((1, 2, 3));
+    match bar {
+        Ok((first, second, third)) => (),
+        Err(_) => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_or() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    $0if let Ok(1 | 2) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    match bar {
+        Ok(1 | 2) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<(i32, i32), ()>) {
+    let bar: Result<(i32, i32), ()> = Ok((1, 2));
+    $0if let Ok((b, a) | (a, b)) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<(i32, i32), ()>) {
+    let bar: Result<(i32, i32), ()> = Ok((1, 2));
+    match bar {
+        Ok((b, a) | (a, b)) => (),
+        Err(_) => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<(i32, i32), ()>) {
+    let bar: Result<(i32, i32), ()> = Ok((1, 2));
+    $0if let Ok((1, a) | (a, 2)) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<(i32, i32), ()>) {
+    let bar: Result<(i32, i32), ()> = Ok((1, 2));
+    match bar {
+        Ok((1, a) | (a, 2)) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_range() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    $0if let Ok(1..2) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    match bar {
+        Ok(1..2) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_paren() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<(i32, i32), ()>) {
+    let bar: Result<(i32, i32), ()> = Ok((1, 1));
+    $0if let Ok(((1, 2))) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<(i32, i32), ()>) {
+    let bar: Result<(i32, i32), ()> = Ok((1, 1));
+    match bar {
+        Ok(((1, 2))) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<(i32, i32), ()>) {
+    let bar: Result<(i32, i32), ()> = Ok((1, 1));
+    $0if let Ok(((a, b))) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<(i32, i32), ()>) {
+    let bar: Result<(i32, i32), ()> = Ok((1, 1));
+    match bar {
+        Ok(((a, b))) => (),
+        Err(_) => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_macro() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<i32, ()>) {
+    macro_rules! is_42 {
+        () => {
+            42
+        };
+    }
+
+    let bar: Result<i32, ()> = Ok(1);
+    $0if let Ok(is_42!()) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<i32, ()>) {
+    macro_rules! is_42 {
+        () => {
+            42
+        };
+    }
+
+    let bar: Result<i32, ()> = Ok(1);
+    match bar {
+        Ok(is_42!()) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_path() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+enum MyEnum {
+    Foo,
+    Bar,
+}
+
+fn foo(x: Result<MyEnum, ()>) {
+    let bar: Result<MyEnum, ()> = Ok(MyEnum::Foo);
+    $0if let Ok(MyEnum::Foo) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+enum MyEnum {
+    Foo,
+    Bar,
+}
+
+fn foo(x: Result<MyEnum, ()>) {
+    let bar: Result<MyEnum, ()> = Ok(MyEnum::Foo);
+    match bar {
+        Ok(MyEnum::Foo) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_record() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+struct MyStruct {
+    foo: i32,
+    bar: i32,
+}
+
+fn foo(x: Result<MyStruct, ()>) {
+    let bar: Result<MyStruct, ()> = Ok(MyStruct { foo: 1, bar: 2 });
+    $0if let Ok(MyStruct { foo, bar }) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+struct MyStruct {
+    foo: i32,
+    bar: i32,
+}
+
+fn foo(x: Result<MyStruct, ()>) {
+    let bar: Result<MyStruct, ()> = Ok(MyStruct { foo: 1, bar: 2 });
+    match bar {
+        Ok(MyStruct { foo, bar }) => (),
+        Err(_) => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+struct MyStruct {
+    foo: i32,
+    bar: i32,
+}
+
+fn foo(x: Result<MyStruct, ()>) {
+    let bar: Result<MyStruct, ()> = Ok(MyStruct { foo: 1, bar: 2 });
+    $0if let Ok(MyStruct { foo, bar: 12 }) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+struct MyStruct {
+    foo: i32,
+    bar: i32,
+}
+
+fn foo(x: Result<MyStruct, ()>) {
+    let bar: Result<MyStruct, ()> = Ok(MyStruct { foo: 1, bar: 2 });
+    match bar {
+        Ok(MyStruct { foo, bar: 12 }) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+struct MyStruct {
+    foo: i32,
+    bar: i32,
+}
+
+fn foo(x: Result<MyStruct, ()>) {
+    let bar: Result<MyStruct, ()> = Ok(MyStruct { foo: 1, bar: 2 });
+    $0if let Ok(MyStruct { foo, .. }) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+struct MyStruct {
+    foo: i32,
+    bar: i32,
+}
+
+fn foo(x: Result<MyStruct, ()>) {
+    let bar: Result<MyStruct, ()> = Ok(MyStruct { foo: 1, bar: 2 });
+    match bar {
+        Ok(MyStruct { foo, .. }) => (),
+        Err(_) => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+enum MyEnum {
+    Foo(i32, i32),
+    Bar { a: i32, b: i32 },
+}
+
+fn foo(x: Result<MyEnum, ()>) {
+    let bar: Result<MyEnum, ()> = Ok(MyEnum::Foo(1, 2));
+    $0if let Ok(MyEnum::Bar { a, b }) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+enum MyEnum {
+    Foo(i32, i32),
+    Bar { a: i32, b: i32 },
+}
+
+fn foo(x: Result<MyEnum, ()>) {
+    let bar: Result<MyEnum, ()> = Ok(MyEnum::Foo(1, 2));
+    match bar {
+        Ok(MyEnum::Bar { a, b }) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_if_let_with_match_nested_ident() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    $0if let Ok(a @ 1..2) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    match bar {
+        Ok(a @ 1..2) => (),
+        _ => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    $0if let Ok(a) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    match bar {
+        Ok(a) => (),
+        Err(_) => (),
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: result
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    $0if let Ok(a @ b @ c @ d) = bar {
+        ()
+    } else {
+        ()
+    }
+}
+"#,
+            r#"
+fn foo(x: Result<i32, ()>) {
+    let bar: Result<i32, ()> = Ok(1);
+    match bar {
+        Ok(a @ b @ c @ d) => (),
+        Err(_) => (),
     }
 }
 "#,
@@ -990,6 +1780,66 @@ fn main() {
     if let 0 = 0 {
         ()
     } else {
+        code()
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn test_replace_match_with_if_bool() {
+        check_assist(
+            replace_match_with_if_let,
+            r#"
+fn main() {
+    match$0 b {
+        true => (),
+        _ => code(),
+    }
+}
+"#,
+            r#"
+fn main() {
+    if b {
+        ()
+    } else {
+        code()
+    }
+}
+"#,
+        );
+        check_assist(
+            replace_match_with_if_let,
+            r#"
+fn main() {
+    match$0 b {
+        false => code(),
+        true => (),
+    }
+}
+"#,
+            r#"
+fn main() {
+    if !b {
+        code()
+    }
+}
+"#,
+        );
+        check_assist(
+            replace_match_with_if_let,
+            r#"
+fn main() {
+    match$0 b {
+        false => (),
+        true => code(),
+    }
+}
+"#,
+            r#"
+fn main() {
+    if b {
         code()
     }
 }

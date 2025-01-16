@@ -155,7 +155,7 @@ fn ptr_add_data() {
 
     assert_eq!(atom.fetch_ptr_sub(1, SeqCst), n.wrapping_add(1));
     assert_eq!(atom.load(SeqCst), n);
-    let bytes_from_n = |b| n.cast::<u8>().wrapping_add(b).cast::<i64>();
+    let bytes_from_n = |b| n.wrapping_byte_add(b);
 
     assert_eq!(atom.fetch_byte_add(1, SeqCst), n);
     assert_eq!(atom.load(SeqCst), bytes_from_n(1));
@@ -188,7 +188,7 @@ fn ptr_bitops() {
 #[cfg(any(not(target_arch = "arm"), target_os = "linux"))] // Missing intrinsic in compiler-builtins
 fn ptr_bitops_tagging() {
     #[repr(align(16))]
-    struct Tagme(u128);
+    struct Tagme(#[allow(dead_code)] u128);
 
     let tagme = Tagme(1000);
     let ptr = &tagme as *const Tagme as *mut Tagme;
@@ -228,6 +228,8 @@ fn static_init() {
 }
 
 #[test]
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#[allow(static_mut_refs)]
 fn atomic_access_bool() {
     static mut ATOMIC: AtomicBool = AtomicBool::new(false);
 
@@ -306,9 +308,11 @@ fn atomic_compare_exchange() {
     ATOMIC.compare_exchange_weak(0, 1, SeqCst, SeqCst).ok();
 }
 
+/* FIXME(#110395)
 #[test]
 fn atomic_const_from() {
     const _ATOMIC_U8: AtomicU8 = AtomicU8::from(1);
     const _ATOMIC_BOOL: AtomicBool = AtomicBool::from(true);
     const _ATOMIC_PTR: AtomicPtr<u32> = AtomicPtr::from(core::ptr::null_mut());
 }
+*/

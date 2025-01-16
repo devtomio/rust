@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint;
 use rustc_hir as hir;
-use rustc_hir::intravisit::{walk_inf, walk_ty, Visitor};
+use rustc_hir::intravisit::{Visitor, walk_inf, walk_ty};
 use rustc_hir::{GenericParamKind, TyKind};
 use rustc_lint::LateContext;
 use rustc_target::spec::abi::Abi;
@@ -44,7 +44,7 @@ impl<'tcx> Visitor<'tcx> for TypeComplexityVisitor {
     fn visit_ty(&mut self, ty: &'tcx hir::Ty<'_>) {
         let (add_score, sub_nest) = match ty.kind {
             // _, &x and *x have only small overhead; don't mess with nesting level
-            TyKind::Infer | TyKind::Ptr(..) | TyKind::Rptr(..) => (1, 0),
+            TyKind::Infer | TyKind::Ptr(..) | TyKind::Ref(..) => (1, 0),
 
             // the "normal" components of a type: named types, arrays/tuples
             TyKind::Path(..) | TyKind::Slice(..) | TyKind::Tup(..) | TyKind::Array(..) => (10 * self.nest, 1),
@@ -57,7 +57,7 @@ impl<'tcx> Visitor<'tcx> for TypeComplexityVisitor {
                     bound
                         .bound_generic_params
                         .iter()
-                        .any(|gen| matches!(gen.kind, GenericParamKind::Lifetime { .. }))
+                        .any(|param| matches!(param.kind, GenericParamKind::Lifetime { .. }))
                 });
                 if has_lifetime_parameters {
                     // complex trait bounds like A<'a, 'b>

@@ -1,25 +1,23 @@
 use gsgdt::{Edge, Graph, Node, NodeStyle};
-use rustc_hir::def_id::DefId;
 use rustc_middle::mir::*;
-use rustc_middle::ty::TyCtxt;
 
 /// Convert an MIR function into a gsgdt Graph
-pub fn mir_fn_to_generic_graph<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'_>) -> Graph {
+pub(crate) fn mir_fn_to_generic_graph<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'_>) -> Graph {
     let def_id = body.source.def_id();
     let def_name = graphviz_safe_def_name(def_id);
-    let graph_name = format!("Mir_{}", def_name);
+    let graph_name = format!("Mir_{def_name}");
     let dark_mode = tcx.sess.opts.unstable_opts.graphviz_dark_mode;
 
     // Nodes
     let nodes: Vec<Node> = body
-        .basic_blocks()
+        .basic_blocks
         .iter_enumerated()
         .map(|(block, _)| bb_to_graph_node(block, body, dark_mode))
         .collect();
 
     // Edges
     let mut edges = Vec::new();
-    for (source, _) in body.basic_blocks().iter_enumerated() {
+    for (source, _) in body.basic_blocks.iter_enumerated() {
         let def_id = body.source.def_id();
         let terminator = body[source].terminator();
         let labels = terminator.kind.fmt_successor_labels();
@@ -48,7 +46,7 @@ fn bb_to_graph_node(block: BasicBlock, body: &Body<'_>, dark_mode: bool) -> Node
     };
 
     let style = NodeStyle { title_bg: Some(bgcolor.to_owned()), ..Default::default() };
-    let mut stmts: Vec<String> = data.statements.iter().map(|x| format!("{:?}", x)).collect();
+    let mut stmts: Vec<String> = data.statements.iter().map(|x| format!("{x:?}")).collect();
 
     // add the terminator to the stmts, gsgdt can print it out separately
     let mut terminator_head = String::new();

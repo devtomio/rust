@@ -5,8 +5,8 @@
 //     7 8
 //     10
 
-#![allow(unused_attributes)]
-#![feature(auto_traits, lang_items, no_core, start, intrinsics, track_caller)]
+#![allow(internal_features, unused_attributes)]
+#![feature(auto_traits, lang_items, no_core, start, intrinsics, rustc_attrs, track_caller)]
 
 #![no_std]
 #![no_core]
@@ -56,15 +56,18 @@ mod libc {
 }
 
 mod intrinsics {
-    extern "rust-intrinsic" {
-        pub fn abort() -> !;
+    #[rustc_nounwind]
+    #[rustc_intrinsic]
+    #[rustc_intrinsic_must_be_overridden]
+    pub fn abort() -> ! {
+        loop {}
     }
 }
 
 #[lang = "panic"]
 #[track_caller]
 #[no_mangle]
-pub fn panic(_msg: &str) -> ! {
+pub fn panic(_msg: &'static str) -> ! {
     unsafe {
         libc::puts("Panicking\0" as *const str as *const u8);
         libc::fflush(libc::stdout);
@@ -117,6 +120,12 @@ impl Add for isize {
     fn add(self, rhs: Self) -> Self {
         self + rhs
     }
+}
+
+#[track_caller]
+#[lang = "panic_const_add_overflow"]
+pub fn panic_const_add_overflow() -> ! {
+    panic("attempt to add with overflow");
 }
 
 /*

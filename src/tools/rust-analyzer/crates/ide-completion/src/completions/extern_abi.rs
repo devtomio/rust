@@ -1,7 +1,7 @@
 //! Completes function abi strings.
 use syntax::{
     ast::{self, IsString},
-    AstNode, AstToken,
+    AstNode, AstToken, SmolStr,
 };
 
 use crate::{
@@ -26,32 +26,39 @@ const SUPPORTED_CALLING_CONVENTIONS: &[&str] = &[
     "ptx-kernel",
     "msp430-interrupt",
     "x86-interrupt",
-    "amdgpu-kernel",
     "efiapi",
     "avr-interrupt",
     "avr-non-blocking-interrupt",
+    "riscv-interrupt-m",
+    "riscv-interrupt-s",
     "C-cmse-nonsecure-call",
+    "C-cmse-nonsecure-entry",
     "wasm",
     "system",
     "system-unwind",
     "rust-intrinsic",
     "rust-call",
-    "platform-intrinsic",
     "unadjusted",
 ];
 
 pub(crate) fn complete_extern_abi(
     acc: &mut Completions,
-    _ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_>,
     expanded: &ast::String,
 ) -> Option<()> {
-    if !expanded.syntax().parent().map_or(false, |it| ast::Abi::can_cast(it.kind())) {
+    if !expanded.syntax().parent().is_some_and(|it| ast::Abi::can_cast(it.kind())) {
         return None;
     }
     let abi_str = expanded;
     let source_range = abi_str.text_range_between_quotes()?;
     for &abi in SUPPORTED_CALLING_CONVENTIONS {
-        CompletionItem::new(CompletionItemKind::Keyword, source_range, abi).add_to(acc);
+        CompletionItem::new(
+            CompletionItemKind::Keyword,
+            source_range,
+            SmolStr::new_static(abi),
+            ctx.edition,
+        )
+        .add_to(acc, ctx.db);
     }
     Some(())
 }

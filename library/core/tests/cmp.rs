@@ -1,7 +1,5 @@
-use core::cmp::{
-    self,
-    Ordering::{self, *},
-};
+use core::cmp::Ordering::{self, *};
+use core::cmp::{self};
 
 #[test]
 fn test_int_totalord() {
@@ -217,18 +215,19 @@ fn cmp_default() {
     assert_eq!(Fool(false), Fool(true));
 }
 
+/* FIXME(#110395)
 mod const_cmp {
     use super::*;
 
     struct S(i32);
 
-    impl const PartialEq for S {
+    impl PartialEq for S {
         fn eq(&self, other: &Self) -> bool {
             self.0 == other.0
         }
     }
 
-    impl const PartialOrd for S {
+    impl PartialOrd for S {
         fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
             let ret = match (self.0, other.0) {
                 (a, b) if a > b => Ordering::Greater,
@@ -248,3 +247,4 @@ mod const_cmp {
     const _: () = assert!(S(0) < S(1));
     const _: () = assert!(S(1) > S(0));
 }
+*/
