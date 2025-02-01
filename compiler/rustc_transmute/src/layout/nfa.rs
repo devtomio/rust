@@ -1,7 +1,8 @@
-use super::{Byte, Ref, Tree, Uninhabited};
-use crate::{Map, Set};
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use super::{Byte, Ref, Tree, Uninhabited};
+use crate::{Map, Set};
 
 /// A non-deterministic finite automaton (NFA) that represents the layout of a type.
 /// The transmutability of two given types is computed by comparing their `Nfa`s.
@@ -86,7 +87,6 @@ where
     pub(crate) fn from_tree(tree: Tree<!, R>) -> Result<Self, Uninhabited> {
         Ok(match tree {
             Tree::Byte(b) => Self::from_byte(b),
-            Tree::Def(..) => unreachable!(),
             Tree::Ref(r) => Self::from_ref(r),
             Tree::Alt(alts) => {
                 let mut alts = alts.into_iter().map(Self::from_tree);
@@ -119,13 +119,11 @@ where
 
         let mut transitions: Map<State, Map<Transition<R>, Set<State>>> = self.transitions;
 
-        // the iteration order doesn't matter
-        #[cfg_attr(feature = "rustc", allow(rustc::potential_query_instability))]
         for (source, transition) in other.transitions {
             let fix_state = |state| if state == other.start { self.accepting } else { state };
             let entry = transitions.entry(fix_state(source)).or_default();
             for (edge, destinations) in transition {
-                let entry = entry.entry(edge.clone()).or_default();
+                let entry = entry.entry(edge).or_default();
                 for destination in destinations {
                     entry.insert(fix_state(destination));
                 }
@@ -142,8 +140,6 @@ where
 
         let mut transitions: Map<State, Map<Transition<R>, Set<State>>> = self.transitions.clone();
 
-        // the iteration order doesn't matter
-        #[cfg_attr(feature = "rustc", allow(rustc::potential_query_instability))]
         for (&(mut source), transition) in other.transitions.iter() {
             // if source is starting state of `other`, replace with starting state of `self`
             if source == other.start {
@@ -151,9 +147,7 @@ where
             }
             let entry = transitions.entry(source).or_default();
             for (edge, destinations) in transition {
-                let entry = entry.entry(edge.clone()).or_default();
-                // the iteration order doesn't matter
-                #[cfg_attr(feature = "rustc", allow(rustc::potential_query_instability))]
+                let entry = entry.entry(*edge).or_default();
                 for &(mut destination) in destinations {
                     // if dest is accepting state of `other`, replace with accepting state of `self`
                     if destination == other.accepting {
@@ -166,6 +160,7 @@ where
         Self { transitions, start, accepting }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn edges_from(&self, start: State) -> Option<&Map<Transition<R>, Set<State>>> {
         self.transitions.get(&start)
     }

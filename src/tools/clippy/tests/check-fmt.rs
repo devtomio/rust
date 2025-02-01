@@ -1,4 +1,3 @@
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
 use std::path::PathBuf;
@@ -13,7 +12,7 @@ fn fmt() {
     let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new("cargo")
         .current_dir(root_dir)
-        .args(&["dev", "fmt", "--check"])
+        .args(["dev", "fmt", "--check"])
         .output()
         .unwrap();
 

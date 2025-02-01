@@ -1,17 +1,19 @@
 //! Renderer for `enum` variants.
 
-use hir::{db::HirDatabase, Documentation, HasAttrs, StructKind};
-use ide_db::SymbolKind;
-use syntax::AstNode;
+use hir::{db::HirDatabase, StructKind};
+use ide_db::{
+    documentation::{Documentation, HasDocs},
+    SymbolKind,
+};
 
 use crate::{
     context::{CompletionContext, PathCompletionCtx, PathKind},
     item::{Builder, CompletionItem},
     render::{
-        compute_ref_match, compute_type_match,
+        compute_type_match,
         variant::{
-            format_literal_label, render_record_lit, render_tuple_lit, visible_fields,
-            RenderedLiteral,
+            format_literal_label, format_literal_lookup, render_record_lit, render_tuple_lit,
+            visible_fields, RenderedLiteral,
         },
         RenderContext,
     },
@@ -25,7 +27,7 @@ pub(crate) fn render_variant_lit(
     variant: hir::Variant,
     path: Option<hir::ModPath>,
 ) -> Option<Builder> {
-    let _p = profile::span("render_enum_variant");
+    let _p = tracing::info_span!("render_variant_lit").entered();
     let db = ctx.db();
 
     let name = local_name.unwrap_or_else(|| variant.name(db));
@@ -39,7 +41,7 @@ pub(crate) fn render_struct_literal(
     path: Option<hir::ModPath>,
     local_name: Option<hir::Name>,
 ) -> Option<Builder> {
-    let _p = profile::span("render_struct_literal");
+    let _p = tracing::info_span!("render_struct_literal").entered();
     let db = ctx.db();
 
     let name = local_name.unwrap_or_else(|| strukt.name(db));
@@ -55,11 +57,11 @@ fn render(
 ) -> Option<Builder> {
     let db = completion.db;
     let mut kind = thing.kind(db);
-    let should_add_parens = match &path_ctx {
-        PathCompletionCtx { has_call_parens: true, .. } => false,
-        PathCompletionCtx { kind: PathKind::Use | PathKind::Type { .. }, .. } => false,
-        _ => true,
-    };
+    let should_add_parens = !matches!(
+        path_ctx,
+        PathCompletionCtx { has_call_parens: true, .. }
+            | PathCompletionCtx { kind: PathKind::Use | PathKind::Type { .. }, .. }
+    );
 
     let fields = thing.fields(completion)?;
     let (qualified_name, short_qualified_name, qualified) = match path {
@@ -72,20 +74,22 @@ fn render(
         }
         None => (name.clone().into(), name.into(), false),
     };
-    let (qualified_name, escaped_qualified_name) =
-        (qualified_name.unescaped().to_string(), qualified_name.to_string());
+    let (qualified_name, escaped_qualified_name) = (
+        qualified_name.display_verbatim(ctx.db()).to_string(),
+        qualified_name.display(ctx.db(), completion.edition).to_string(),
+    );
     let snippet_cap = ctx.snippet_cap();
 
     let mut rendered = match kind {
         StructKind::Tuple if should_add_parens => {
-            render_tuple_lit(db, snippet_cap, &fields, &escaped_qualified_name)
+            render_tuple_lit(db, snippet_cap, &fields, &escaped_qualified_name, completion.edition)
         }
         StructKind::Record if should_add_parens => {
-            render_record_lit(db, snippet_cap, &fields, &escaped_qualified_name)
+            render_record_lit(db, snippet_cap, &fields, &escaped_qualified_name, completion.edition)
         }
         _ => RenderedLiteral {
             literal: escaped_qualified_name.clone(),
-            detail: escaped_qualified_name.clone(),
+            detail: escaped_qualified_name,
         },
     };
 
@@ -97,23 +101,31 @@ fn render(
     if !should_add_parens {
         kind = StructKind::Unit;
     }
+    let label = format_literal_label(&qualified_name, kind, snippet_cap);
+    let lookup = if qualified {
+        format_literal_lookup(
+            &short_qualified_name.display(ctx.db(), completion.edition).to_string(),
+            kind,
+        )
+    } else {
+        format_literal_lookup(&qualified_name, kind)
+    };
 
     let mut item = CompletionItem::new(
         CompletionItemKind::SymbolKind(thing.symbol_kind()),
         ctx.source_range(),
-        format_literal_label(&qualified_name, kind),
+        label,
+        completion.edition,
     );
 
+    item.lookup_by(lookup);
     item.detail(rendered.detail);
 
     match snippet_cap {
-        Some(snippet_cap) => item.insert_snippet(snippet_cap, rendered.literal),
+        Some(snippet_cap) => item.insert_snippet(snippet_cap, rendered.literal).trigger_call_info(),
         None => item.insert_text(rendered.literal),
     };
 
-    if qualified {
-        item.lookup_by(format_literal_label(&short_qualified_name.to_string(), kind));
-    }
     item.set_documentation(thing.docs(db)).set_deprecated(thing.is_deprecated(&ctx));
 
     let ty = thing.ty(db);
@@ -121,9 +133,8 @@ fn render(
         type_match: compute_type_match(ctx.completion, &ty),
         ..ctx.completion_relevance()
     });
-    if let Some(ref_match) = compute_ref_match(completion, &ty) {
-        item.ref_match(ref_match, path_ctx.path.syntax().text_range().start());
-    }
+
+    super::path_ref_match(completion, path_ctx, &ty, &mut item);
 
     if let Some(import_to_add) = ctx.import_to_add {
         item.add_import(import_to_add);

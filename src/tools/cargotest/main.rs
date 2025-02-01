@@ -1,7 +1,6 @@
-use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{env, fs};
 
 struct Test {
     repo: &'static str,
@@ -73,7 +72,7 @@ const TEST_REPOS: &[Test] = &[
     Test {
         name: "servo",
         repo: "https://github.com/servo/servo",
-        sha: "caac107ae8145ef2fd20365e2b8fadaf09c2eb3b",
+        sha: "785a344e32db58d4e631fd3cae17fd1f29a721ab",
         lock: None,
         // Only test Stylo a.k.a. Quantum CSS, the parts of Servo going into Firefox.
         // This takes much less time to build than all of Servo and supports stable Rust.
@@ -140,7 +139,7 @@ fn clone_repo(test: &Test, out_dir: &Path) -> PathBuf {
             let status = Command::new("git")
                 .arg("fetch")
                 .arg(test.repo)
-                .arg("master")
+                .arg(test.sha)
                 .arg(&format!("--depth={}", depth))
                 .current_dir(&out_dir)
                 .status()
@@ -206,6 +205,10 @@ fn run_cargo_test(
         .env("CFG_DISABLE_CROSS_TESTS", "1")
         // Relax #![deny(warnings)] in some crates
         .env("RUSTFLAGS", "--cap-lints warn")
+        // servo tries to use 'lld-link.exe' on windows, but we don't
+        // have lld on our PATH in CI. Override it to use 'link.exe'
+        .env("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", "link.exe")
+        .env("CARGO_TARGET_I686_PC_WINDOWS_MSVC_LINKER", "link.exe")
         .current_dir(crate_path)
         .status()
         .unwrap();

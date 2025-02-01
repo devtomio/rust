@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::path_def_id;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::{implements_trait, is_copy};
-use clippy_utils::{match_any_def_paths, path_def_id, paths};
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind, UnOp};
 use rustc_lint::LateContext;
@@ -38,24 +38,24 @@ fn symmetric_partial_eq<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, other: Ty<'t
 fn check_op(cx: &LateContext<'_>, expr: &Expr<'_>, other: &Expr<'_>, left: bool) {
     let typeck = cx.typeck_results();
     let (arg, arg_span) = match expr.kind {
-        ExprKind::MethodCall(.., [arg], _)
+        ExprKind::MethodCall(_, arg, [], _)
             if typeck
                 .type_dependent_def_id(expr.hir_id)
                 .and_then(|id| cx.tcx.trait_of_item(id))
-                .map_or(false, |id| {
-                    matches!(cx.tcx.get_diagnostic_name(id), Some(sym::ToString | sym::ToOwned))
-                }) =>
+                .is_some_and(|id| matches!(cx.tcx.get_diagnostic_name(id), Some(sym::ToString | sym::ToOwned))) =>
         {
             (arg, arg.span)
         },
         ExprKind::Call(path, [arg])
-            if path_def_id(cx, path)
-                .and_then(|id| match_any_def_paths(cx, id, &[&paths::FROM_STR_METHOD, &paths::FROM_FROM]))
-                .map_or(false, |idx| match idx {
-                    0 => true,
-                    1 => !is_copy(cx, typeck.expr_ty(expr)),
-                    _ => false,
-                }) =>
+            if path_def_id(cx, path).is_some_and(|did| {
+                if cx.tcx.is_diagnostic_item(sym::from_str_method, did) {
+                    true
+                } else if cx.tcx.is_diagnostic_item(sym::from_fn, did) {
+                    !is_copy(cx, typeck.expr_ty(expr))
+                } else {
+                    false
+                }
+            }) =>
         {
             (arg, arg.span)
         },
@@ -68,7 +68,7 @@ fn check_op(cx: &LateContext<'_>, expr: &Expr<'_>, other: &Expr<'_>, left: bool)
     let without_deref = symmetric_partial_eq(cx, arg_ty, other_ty).unwrap_or_default();
     let with_deref = arg_ty
         .builtin_deref(true)
-        .and_then(|tam| symmetric_partial_eq(cx, tam.ty, other_ty))
+        .and_then(|ty| symmetric_partial_eq(cx, ty, other_ty))
         .unwrap_or_default();
 
     if !with_deref.is_implemented() && !without_deref.is_implemented() {
@@ -99,12 +99,12 @@ fn check_op(cx: &LateContext<'_>, expr: &Expr<'_>, other: &Expr<'_>, left: bool)
             let expr_snip;
             let eq_impl;
             if with_deref.is_implemented() {
-                expr_snip = format!("*{}", arg_snip);
+                expr_snip = format!("*{arg_snip}");
                 eq_impl = with_deref;
             } else {
                 expr_snip = arg_snip.to_string();
                 eq_impl = without_deref;
-            };
+            }
 
             let span;
             let hint;
@@ -121,17 +121,15 @@ fn check_op(cx: &LateContext<'_>, expr: &Expr<'_>, other: &Expr<'_>, left: bool)
                 };
                 if eq_impl.ty_eq_other {
                     hint = format!(
-                        "{}{}{}",
-                        expr_snip,
+                        "{expr_snip}{}{}",
                         snippet(cx, cmp_span, ".."),
                         snippet(cx, other.span, "..")
                     );
                 } else {
                     hint = format!(
-                        "{}{}{}",
+                        "{}{}{expr_snip}",
                         snippet(cx, other.span, ".."),
-                        snippet(cx, cmp_span, ".."),
-                        expr_snip
+                        snippet(cx, cmp_span, "..")
                     );
                 }
             }

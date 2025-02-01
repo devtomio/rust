@@ -1,21 +1,22 @@
 use std::iter;
 
 use either::Either;
-use hir::{Module, ModuleDef, Name, Variant};
+use hir::{HasCrate, Module, ModuleDef, Name, Variant};
 use ide_db::{
     defs::Definition,
     helpers::mod_path_to_ast,
     imports::insert_use::{insert_use, ImportScope, InsertUseConfig},
+    path_transform::PathTransform,
     search::FileReference,
     FxHashSet, RootDatabase,
 };
-use itertools::{Itertools, Position};
+use itertools::Itertools;
 use syntax::{
     ast::{
         self, edit::IndentLevel, edit_in_place::Indent, make, AstNode, HasAttrs, HasGenericParams,
         HasName, HasVisibility,
     },
-    match_ast, ted, SyntaxElement,
+    match_ast, ted, Edition, SyntaxElement,
     SyntaxKind::*,
     SyntaxNode, T,
 };
@@ -57,6 +58,7 @@ pub(crate) fn extract_struct_from_enum_variant(
         "Extract struct from enum variant",
         target,
         |builder| {
+            let edition = enum_hir.krate(ctx.db()).edition(ctx.db());
             let variant_hir_name = variant_hir.name(ctx.db());
             let enum_module_def = ModuleDef::from(enum_hir);
             let usages = Definition::Variant(variant_hir).usages(&ctx.sema).all();
@@ -71,7 +73,7 @@ pub(crate) fn extract_struct_from_enum_variant(
                     def_file_references = Some(references);
                     continue;
                 }
-                builder.edit_file(file_id);
+                builder.edit_file(file_id.file_id());
                 let processed = process_references(
                     ctx,
                     builder,
@@ -81,7 +83,7 @@ pub(crate) fn extract_struct_from_enum_variant(
                     references,
                 );
                 processed.into_iter().for_each(|(path, node, import)| {
-                    apply_references(ctx.config.insert_use, path, node, import)
+                    apply_references(ctx.config.insert_use, path, node, import, edition)
                 });
             }
             builder.edit_file(ctx.file_id());
@@ -97,25 +99,36 @@ pub(crate) fn extract_struct_from_enum_variant(
                     references,
                 );
                 processed.into_iter().for_each(|(path, node, import)| {
-                    apply_references(ctx.config.insert_use, path, node, import)
+                    apply_references(ctx.config.insert_use, path, node, import, edition)
                 });
             }
 
-            let indent = enum_ast.indent_level();
             let generic_params = enum_ast
                 .generic_param_list()
                 .and_then(|known_generics| extract_generic_params(&known_generics, &field_list));
             let generics = generic_params.as_ref().map(|generics| generics.clone_for_update());
+
+            // resolve GenericArg in field_list to actual type
+            let field_list = field_list.clone_for_update();
+            if let Some((target_scope, source_scope)) =
+                ctx.sema.scope(enum_ast.syntax()).zip(ctx.sema.scope(field_list.syntax()))
+            {
+                PathTransform::generic_transformation(&target_scope, &source_scope)
+                    .apply(field_list.syntax());
+            }
+
             let def =
                 create_struct_def(variant_name.clone(), &variant, &field_list, generics, &enum_ast);
+
+            let enum_ast = variant.parent_enum();
+            let indent = enum_ast.indent_level();
             def.reindent_to(indent);
 
-            let start_offset = &variant.parent_enum().syntax().clone();
-            ted::insert_all_raw(
-                ted::Position::before(start_offset),
+            ted::insert_all(
+                ted::Position::before(enum_ast.syntax()),
                 vec![
                     def.syntax().clone().into(),
-                    make::tokens::whitespace(&format!("\n\n{}", indent)).into(),
+                    make::tokens::whitespace(&format!("\n\n{indent}")).into(),
                 ],
             );
 
@@ -157,7 +170,7 @@ fn existing_definition(db: &RootDatabase, variant_name: &ast::Name, variant: &Va
             ),
             _ => false,
         })
-        .any(|(name, _)| name.to_string() == variant_name.to_string())
+        .any(|(name, _)| name.as_str() == variant_name.text().trim_start_matches("r#"))
 }
 
 fn extract_generic_params(
@@ -177,7 +190,7 @@ fn extract_generic_params(
             .fold(false, |tagged, ty| tag_generics_in_variant(&ty, &mut generics) || tagged),
     };
 
-    let generics = generics.into_iter().filter_map(|(param, tag)| tag.then(|| param));
+    let generics = generics.into_iter().filter_map(|(param, tag)| tag.then_some(param));
     tagged_one.then(|| make::generic_param_list(generics))
 }
 
@@ -227,7 +240,7 @@ fn tag_generics_in_variant(ty: &ast::Type, generics: &mut [(ast::GenericParam, b
 }
 
 fn create_struct_def(
-    variant_name: ast::Name,
+    name: ast::Name,
     variant: &ast::Variant,
     field_list: &Either<ast::RecordFieldList, ast::TupleFieldList>,
     generics: Option<ast::GenericParamList>,
@@ -243,8 +256,6 @@ fn create_struct_def(
     // for fields without any existing visibility, use visibility of enum
     let field_list: ast::FieldList = match field_list {
         Either::Left(field_list) => {
-            let field_list = field_list.clone_for_update();
-
             if let Some(vis) = &enum_vis {
                 field_list
                     .fields()
@@ -253,11 +264,9 @@ fn create_struct_def(
                     .for_each(|it| insert_vis(it.syntax(), vis.syntax()));
             }
 
-            field_list.into()
+            field_list.clone().into()
         }
         Either::Right(field_list) => {
-            let field_list = field_list.clone_for_update();
-
             if let Some(vis) = &enum_vis {
                 field_list
                     .fields()
@@ -266,94 +275,84 @@ fn create_struct_def(
                     .for_each(|it| insert_vis(it.syntax(), vis.syntax()));
             }
 
-            field_list.into()
+            field_list.clone().into()
         }
     };
-
     field_list.reindent_to(IndentLevel::single());
 
-    let strukt = make::struct_(enum_vis, variant_name, generics, field_list).clone_for_update();
+    let strukt = make::struct_(enum_vis, name, generics, field_list).clone_for_update();
 
-    // FIXME: Consider making this an actual function somewhere (like in `AttrsOwnerEdit`) after some deliberation
-    let attrs_and_docs = |node: &SyntaxNode| {
-        let mut select_next_ws = false;
-        node.children_with_tokens().filter(move |child| {
-            let accept = match child.kind() {
-                ATTR | COMMENT => {
-                    select_next_ws = true;
-                    return true;
-                }
-                WHITESPACE if select_next_ws => true,
-                _ => false,
-            };
-            select_next_ws = false;
-
-            accept
-        })
-    };
-
-    // copy attributes & comments from variant
-    let variant_attrs = attrs_and_docs(variant.syntax())
-        .map(|tok| match tok.kind() {
-            WHITESPACE => make::tokens::single_newline().into(),
-            _ => tok,
-        })
-        .collect();
-    ted::insert_all(ted::Position::first_child_of(strukt.syntax()), variant_attrs);
+    // take comments from variant
+    ted::insert_all(
+        ted::Position::first_child_of(strukt.syntax()),
+        take_all_comments(variant.syntax()),
+    );
 
     // copy attributes from enum
     ted::insert_all(
         ted::Position::first_child_of(strukt.syntax()),
-        enum_.attrs().map(|it| it.syntax().clone_for_update().into()).collect(),
+        enum_
+            .attrs()
+            .flat_map(|it| {
+                vec![it.syntax().clone_for_update().into(), make::tokens::single_newline().into()]
+            })
+            .collect(),
     );
+
     strukt
 }
 
 fn update_variant(variant: &ast::Variant, generics: Option<ast::GenericParamList>) -> Option<()> {
     let name = variant.name()?;
-    let ty = generics
+    let generic_args = generics
         .filter(|generics| generics.generic_params().count() > 0)
-        .map(|generics| {
-            let mut generic_str = String::with_capacity(8);
+        .map(|generics| generics.to_generic_args());
+    // FIXME: replace with a `ast::make` constructor
+    let ty = match generic_args {
+        Some(generic_args) => make::ty(&format!("{name}{generic_args}")),
+        None => make::ty(&name.text()),
+    };
 
-            for (p, more) in generics.generic_params().with_position().map(|p| match p {
-                Position::First(p) | Position::Middle(p) => (p, true),
-                Position::Last(p) | Position::Only(p) => (p, false),
-            }) {
-                match p {
-                    ast::GenericParam::ConstParam(konst) => {
-                        if let Some(name) = konst.name() {
-                            generic_str.push_str(name.text().as_str());
-                        }
-                    }
-                    ast::GenericParam::LifetimeParam(lt) => {
-                        if let Some(lt) = lt.lifetime() {
-                            generic_str.push_str(lt.text().as_str());
-                        }
-                    }
-                    ast::GenericParam::TypeParam(ty) => {
-                        if let Some(name) = ty.name() {
-                            generic_str.push_str(name.text().as_str());
-                        }
-                    }
-                }
-                if more {
-                    generic_str.push_str(", ");
-                }
-            }
-
-            make::ty(&format!("{}<{}>", &name.text(), &generic_str))
-        })
-        .unwrap_or_else(|| make::ty(&name.text()));
-
+    // change from a record to a tuple field list
     let tuple_field = make::tuple_field(None, ty);
-    let replacement = make::variant(
-        name,
-        Some(ast::FieldList::TupleFieldList(make::tuple_field_list(iter::once(tuple_field)))),
-    )
-    .clone_for_update();
-    ted::replace(variant.syntax(), replacement.syntax());
+    let field_list = make::tuple_field_list(iter::once(tuple_field)).clone_for_update();
+    ted::replace(variant.field_list()?.syntax(), field_list.syntax());
+
+    // remove any ws after the name
+    if let Some(ws) = name
+        .syntax()
+        .siblings_with_tokens(syntax::Direction::Next)
+        .find_map(|tok| tok.into_token().filter(|tok| tok.kind() == WHITESPACE))
+    {
+        ted::remove(SyntaxElement::Token(ws));
+    }
+
     Some(())
+}
+
+// Note: this also detaches whitespace after comments,
+// since `SyntaxNode::splice_children` (and by extension `ted::insert_all_raw`)
+// detaches nodes. If we only took the comments, we'd leave behind the old whitespace.
+fn take_all_comments(node: &SyntaxNode) -> Vec<SyntaxElement> {
+    let mut remove_next_ws = false;
+    node.children_with_tokens()
+        .filter_map(move |child| match child.kind() {
+            COMMENT => {
+                remove_next_ws = true;
+                child.detach();
+                Some(child)
+            }
+            WHITESPACE if remove_next_ws => {
+                remove_next_ws = false;
+                child.detach();
+                Some(make::tokens::single_newline().into())
+            }
+            _ => {
+                remove_next_ws = false;
+                None
+            }
+        })
+        .collect()
 }
 
 fn apply_references(
@@ -361,9 +360,10 @@ fn apply_references(
     segment: ast::PathSegment,
     node: SyntaxNode,
     import: Option<(ImportScope, hir::ModPath)>,
+    edition: Edition,
 ) {
     if let Some((scope, path)) = import {
-        insert_use(&scope, mod_path_to_ast(&path), &insert_use_cfg);
+        insert_use(&scope, mod_path_to_ast(&path, edition), &insert_use_cfg);
     }
     // deep clone to prevent cycle
     let path = make::path_from_segments(iter::once(segment.clone_subtree()), false);
@@ -388,10 +388,11 @@ fn process_references(
             let segment = builder.make_mut(segment);
             let scope_node = builder.make_syntax_mut(scope_node);
             if !visited_modules.contains(&module) {
-                let mod_path = module.find_use_path_prefixed(
+                let mod_path = module.find_use_path(
                     ctx.sema.db,
                     *enum_module_def,
                     ctx.config.insert_use.prefix_kind,
+                    ctx.config.import_path_config(),
                 );
                 if let Some(mut mod_path) = mod_path {
                     mod_path.pop_segment();
@@ -412,6 +413,13 @@ fn reference_to_node(
 ) -> Option<(ast::PathSegment, SyntaxNode, hir::Module)> {
     let segment =
         reference.name.as_name_ref()?.syntax().parent().and_then(ast::PathSegment::cast)?;
+
+    // filter out the reference in marco
+    let segment_range = segment.syntax().text_range();
+    if segment_range != reference.range {
+        return None;
+    }
+
     let parent = segment.parent_path().syntax().parent()?;
     let expr_or_pat = match_ast! {
         match parent {
@@ -431,6 +439,98 @@ mod tests {
     use crate::tests::{check_assist, check_assist_not_applicable};
 
     use super::*;
+
+    #[test]
+    fn test_with_marco() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            r#"
+macro_rules! foo {
+    ($x:expr) => {
+        $x
+    };
+}
+
+enum TheEnum {
+    TheVariant$0 { the_field: u8 },
+}
+
+fn main() {
+    foo![TheEnum::TheVariant { the_field: 42 }];
+}
+"#,
+            r#"
+macro_rules! foo {
+    ($x:expr) => {
+        $x
+    };
+}
+
+struct TheVariant{ the_field: u8 }
+
+enum TheEnum {
+    TheVariant(TheVariant),
+}
+
+fn main() {
+    foo![TheEnum::TheVariant { the_field: 42 }];
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn issue_16197() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            r#"
+enum Foo {
+    Bar $0{ node: Box<Self> },
+    Nil,
+}
+"#,
+            r#"
+struct Bar{ node: Box<Foo> }
+
+enum Foo {
+    Bar(Bar),
+    Nil,
+}
+"#,
+        );
+        check_assist(
+            extract_struct_from_enum_variant,
+            r#"
+enum Foo {
+    Bar $0{ node: Box<Self>, a: Arc<Box<Self>> },
+    Nil,
+}
+"#,
+            r#"
+struct Bar{ node: Box<Foo>, a: Arc<Box<Foo>> }
+
+enum Foo {
+    Bar(Bar),
+    Nil,
+}
+"#,
+        );
+        check_assist(
+            extract_struct_from_enum_variant,
+            r#"
+enum Foo {
+    Nil(Box$0<Self>, Arc<Box<Self>>),
+}
+"#,
+            r#"
+struct Nil(Box<Foo>, Arc<Box<Foo>>);
+
+enum Foo {
+    Nil(Nil),
+}
+"#,
+        );
+    }
 
     #[test]
     fn test_extract_struct_several_fields_tuple() {
@@ -480,10 +580,14 @@ enum En<T> { Var(Var<T>) }"#,
     fn test_extract_struct_carries_over_attributes() {
         check_assist(
             extract_struct_from_enum_variant,
-            r#"#[derive(Debug)]
+            r#"
+#[derive(Debug)]
 #[derive(Clone)]
 enum Enum { Variant{ field: u32$0 } }"#,
-            r#"#[derive(Debug)]#[derive(Clone)] struct Variant{ field: u32 }
+            r#"
+#[derive(Debug)]
+#[derive(Clone)]
+struct Variant{ field: u32 }
 
 #[derive(Debug)]
 #[derive(Clone)]
@@ -614,7 +718,7 @@ enum A { One(One) }"#,
     }
 
     #[test]
-    fn test_extract_struct_keep_comments_and_attrs_on_variant_struct() {
+    fn test_extract_struct_move_struct_variant_comments() {
         check_assist(
             extract_struct_from_enum_variant,
             r#"
@@ -631,19 +735,19 @@ enum A {
 /* comment */
 // other
 /// comment
-#[attr]
 struct One{
     a: u32
 }
 
 enum A {
+    #[attr]
     One(One)
 }"#,
         );
     }
 
     #[test]
-    fn test_extract_struct_keep_comments_and_attrs_on_variant_tuple() {
+    fn test_extract_struct_move_tuple_variant_comments() {
         check_assist(
             extract_struct_from_enum_variant,
             r#"
@@ -658,10 +762,10 @@ enum A {
 /* comment */
 // other
 /// comment
-#[attr]
 struct One(u32, u32);
 
 enum A {
+    #[attr]
     One(One)
 }"#,
         );
@@ -778,7 +882,7 @@ fn another_fn() {
             r#"use my_mod::my_other_mod::MyField;
 
 mod my_mod {
-    use self::my_other_mod::MyField;
+    use my_other_mod::MyField;
 
     fn another_fn() {
         let m = my_other_mod::MyEnum::MyField(MyField(1, 1));
@@ -1010,7 +1114,7 @@ enum X<'a, 'b, 'x> {
     }
 
     #[test]
-    fn test_extract_struct_with_liftime_type_const() {
+    fn test_extract_struct_with_lifetime_type_const() {
         check_assist(
             extract_struct_from_enum_variant,
             r#"

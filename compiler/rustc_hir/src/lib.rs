@@ -2,21 +2,18 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/hir.html
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
 #![feature(associated_type_defaults)]
 #![feature(closure_track_caller)]
-#![feature(const_btree_new)]
-#![feature(let_else)]
-#![feature(once_cell)]
-#![feature(min_specialization)]
+#![feature(debug_closure_helpers)]
+#![feature(exhaustive_patterns)]
+#![feature(let_chains)]
 #![feature(never_type)]
 #![feature(rustc_attrs)]
-#![recursion_limit = "256"]
-
-#[macro_use]
-extern crate rustc_macros;
-
-#[macro_use]
-extern crate rustc_data_structures;
+#![feature(variant_count)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 extern crate self as rustc_hir;
 
@@ -38,6 +35,7 @@ pub mod weak_lang_items;
 #[cfg(test)]
 mod tests;
 
+#[doc(no_inline)]
 pub use hir::*;
 pub use hir_id::*;
 pub use lang_items::{LangItem, LanguageItems};

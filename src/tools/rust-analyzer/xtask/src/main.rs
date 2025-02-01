@@ -8,38 +8,45 @@
 //! This binary is integrated into the `cargo` command line by using an alias in
 //! `.cargo/config`.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
+#![allow(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::disallowed_methods,
+    clippy::disallowed_types
+)]
 
 mod flags;
 
-mod install;
-mod release;
+mod codegen;
 mod dist;
+mod install;
 mod metrics;
+mod publish;
+mod release;
+mod tidy;
+mod util;
 
 use anyhow::bail;
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::{env, path::PathBuf};
 use xshell::{cmd, Shell};
 
 fn main() -> anyhow::Result<()> {
+    let flags = flags::Xtask::from_env_or_exit();
+
     let sh = &Shell::new()?;
     sh.change_dir(project_root());
 
-    let flags = flags::Xtask::from_env()?;
     match flags.subcommand {
-        flags::XtaskCmd::Help(_) => {
-            println!("{}", flags::Xtask::HELP);
-            Ok(())
-        }
         flags::XtaskCmd::Install(cmd) => cmd.run(sh),
         flags::XtaskCmd::FuzzTests(_) => run_fuzzer(sh),
         flags::XtaskCmd::Release(cmd) => cmd.run(sh),
-        flags::XtaskCmd::Promote(cmd) => cmd.run(sh),
+        flags::XtaskCmd::RustcPull(cmd) => cmd.run(sh),
+        flags::XtaskCmd::RustcPush(cmd) => cmd.run(sh),
         flags::XtaskCmd::Dist(cmd) => cmd.run(sh),
+        flags::XtaskCmd::PublishReleaseNotes(cmd) => cmd.run(sh),
         flags::XtaskCmd::Metrics(cmd) => cmd.run(sh),
+        flags::XtaskCmd::Codegen(cmd) => cmd.run(sh),
         flags::XtaskCmd::Bb(cmd) => {
             {
                 let _d = sh.push_dir("./crates/rust-analyzer");
@@ -51,17 +58,15 @@ fn main() -> anyhow::Result<()> {
             )?;
             Ok(())
         }
+        flags::XtaskCmd::Tidy(cmd) => cmd.run(sh),
     }
 }
 
+/// Returns the path to the root directory of `rust-analyzer` project.
 fn project_root() -> PathBuf {
-    Path::new(
-        &env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned()),
-    )
-    .ancestors()
-    .nth(1)
-    .unwrap()
-    .to_path_buf()
+    let dir =
+        env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned());
+    PathBuf::from(dir).parent().unwrap().to_owned()
 }
 
 fn run_fuzzer(sh: &Shell) -> anyhow::Result<()> {
