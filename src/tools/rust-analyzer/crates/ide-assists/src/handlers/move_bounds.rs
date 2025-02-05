@@ -1,5 +1,9 @@
 use syntax::{
-    ast::{self, edit_in_place::GenericParamsOwnerEdit, make, AstNode, HasName, HasTypeBounds},
+    ast::{
+        self,
+        edit_in_place::{GenericParamsOwnerEdit, Removable},
+        make, AstNode, HasName, HasTypeBounds,
+    },
     match_ast,
 };
 
@@ -74,7 +78,7 @@ pub(crate) fn move_bounds_to_where_clause(
 
 fn build_predicate(param: ast::TypeParam) -> Option<ast::WherePred> {
     let path = make::ext::ident_path(&param.name()?.syntax().to_string());
-    let predicate = make::where_pred(path, param.type_bound_list()?.bounds());
+    let predicate = make::where_pred(make::ty_path(path), param.type_bound_list()?.bounds());
     Some(predicate.clone_for_update())
 }
 

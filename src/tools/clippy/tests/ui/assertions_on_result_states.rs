@@ -1,5 +1,5 @@
-// run-rustfix
 #![warn(clippy::assertions_on_result_states)]
+#![allow(clippy::unnecessary_literal_unwrap)]
 
 use std::result::Result;
 
@@ -74,4 +74,10 @@ fn main() {
     // test err with non-debug value type
     let r: Result<Foo, Foo> = Err(Foo);
     assert!(r.is_err());
+}
+
+#[allow(dead_code)]
+fn issue9450() {
+    let res: Result<i32, i32> = Ok(1);
+    assert!(res.is_err())
 }

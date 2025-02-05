@@ -1,14 +1,13 @@
-// run-rustfix
-
 #![warn(clippy::while_let_on_iterator)]
+#![allow(dead_code, unreachable_code, unused_mut)]
 #![allow(
-    clippy::never_loop,
-    unreachable_code,
-    unused_mut,
-    dead_code,
     clippy::equatable_if_let,
     clippy::manual_find,
-    clippy::redundant_closure_call
+    clippy::never_loop,
+    clippy::redundant_closure_call,
+    clippy::single_range_in_vec_init,
+    clippy::uninlined_format_args,
+    clippy::useless_vec
 )]
 
 fn base() {
@@ -442,7 +441,28 @@ fn fn_once_closure() {
                 break;
             }
         }
-    })
+    });
+
+    trait MySpecialFnMut: FnOnce() {}
+    impl<T: FnOnce()> MySpecialFnMut for T {}
+    fn f4(_: impl MySpecialFnMut) {}
+    let mut it = 0..10;
+    f4(|| {
+        while let Some(x) = it.next() {
+            if x % 2 == 0 {
+                break;
+            }
+        }
+    });
+}
+
+fn issue13123() {
+    let mut it = 0..20;
+    'label: while let Some(n) = it.next() {
+        if n % 25 == 0 {
+            break 'label;
+        }
+    }
 }
 
 fn main() {

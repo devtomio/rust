@@ -1,16 +1,15 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::path_to_local;
-use clippy_utils::source::snippet_opt;
+use clippy_utils::source::{SourceText, SpanRangeExt};
 use clippy_utils::ty::needs_ordered_drop;
-use clippy_utils::visitors::{expr_visitor, expr_visitor_no_bodies, is_local_used};
+use clippy_utils::visitors::{for_each_expr, for_each_expr_without_closures, is_local_used};
+use core::ops::ControlFlow;
 use rustc_errors::{Applicability, MultiSpan};
-use rustc_hir::intravisit::Visitor;
 use rustc_hir::{
-    BindingAnnotation, Block, Expr, ExprKind, HirId, Local, LocalSource, MatchSource, Node, Pat, PatKind, Stmt,
-    StmtKind,
+    BindingMode, Block, Expr, ExprKind, HirId, LetStmt, LocalSource, MatchSource, Node, Pat, PatKind, Stmt, StmtKind,
 };
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -22,7 +21,7 @@ declare_clippy_lint! {
     /// Assigning in the `let` statement is less repetitive.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let a;
     /// a = 1;
     ///
@@ -41,7 +40,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let a = 1;
     ///
     /// let b = match 3 {
@@ -64,35 +63,31 @@ declare_clippy_lint! {
 declare_lint_pass!(NeedlessLateInit => [NEEDLESS_LATE_INIT]);
 
 fn contains_assign_expr<'tcx>(cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'tcx>) -> bool {
-    let mut seen = false;
-    expr_visitor(cx, |expr| {
-        if let ExprKind::Assign(..) = expr.kind {
-            seen = true;
+    for_each_expr(cx, stmt, |e| {
+        if matches!(e.kind, ExprKind::Assign(..)) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
-
-        !seen
     })
-    .visit_stmt(stmt);
-
-    seen
+    .is_some()
 }
 
 fn contains_let(cond: &Expr<'_>) -> bool {
-    let mut seen = false;
-    expr_visitor_no_bodies(|expr| {
-        if let ExprKind::Let(_) = expr.kind {
-            seen = true;
+    for_each_expr_without_closures(cond, |e| {
+        if matches!(e.kind, ExprKind::Let(_)) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
-
-        !seen
     })
-    .visit_expr(cond);
-
-    seen
+    .is_some()
 }
 
 fn stmt_needs_ordered_drop(cx: &LateContext<'_>, stmt: &Stmt<'_>) -> bool {
-    let StmtKind::Local(local) = stmt.kind else { return false };
+    let StmtKind::Let(local) = stmt.kind else {
+        return false;
+    };
     !local.pat.walk_short(|pat| {
         if let PatKind::Binding(.., None) = pat.kind {
             !needs_ordered_drop(cx, cx.typeck_results().pat_ty(pat))
@@ -112,6 +107,10 @@ struct LocalAssign {
 
 impl LocalAssign {
     fn from_expr(expr: &Expr<'_>, span: Span) -> Option<Self> {
+        if expr.span.from_expansion() {
+            return None;
+        }
+
         if let ExprKind::Assign(lhs, rhs, _) = expr.kind {
             if lhs.span.from_expansion() {
                 return None;
@@ -132,21 +131,18 @@ impl LocalAssign {
         let assign = match expr.kind {
             ExprKind::Block(Block { expr: Some(expr), .. }, _) => Self::from_expr(expr, expr.span),
             ExprKind::Block(block, _) => {
-                if_chain! {
-                    if let Some((last, other_stmts)) = block.stmts.split_last();
-                    if let StmtKind::Expr(expr) | StmtKind::Semi(expr) = last.kind;
+                if let Some((last, other_stmts)) = block.stmts.split_last()
+                    && let StmtKind::Expr(expr) | StmtKind::Semi(expr) = last.kind
 
-                    let assign = Self::from_expr(expr, last.span)?;
+                    && let assign = Self::from_expr(expr, last.span)?
 
                     // avoid visiting if not needed
-                    if assign.lhs_id == binding_id;
-                    if other_stmts.iter().all(|stmt| !contains_assign_expr(cx, stmt));
-
-                    then {
-                        Some(assign)
-                    } else {
-                        None
-                    }
+                    && assign.lhs_id == binding_id
+                    && other_stmts.iter().all(|stmt| !contains_assign_expr(cx, stmt))
+                {
+                    Some(assign)
+                } else {
+                    None
                 }
             },
             ExprKind::Assign(..) => Self::from_expr(expr, expr.span),
@@ -186,10 +182,13 @@ fn assignment_suggestions<'tcx>(
     let suggestions = assignments
         .iter()
         .flat_map(|assignment| {
-            [
-                assignment.span.until(assignment.rhs_span),
-                assignment.rhs_span.shrink_to_hi().with_hi(assignment.span.hi()),
-            ]
+            let mut spans = vec![assignment.span.until(assignment.rhs_span)];
+
+            if assignment.rhs_span.hi() != assignment.span.hi() {
+                spans.push(assignment.rhs_span.shrink_to_hi().with_hi(assignment.span.hi()));
+            }
+
+            spans
         })
         .map(|span| (span, String::new()))
         .collect::<Vec<(Span, String)>>();
@@ -241,7 +240,7 @@ fn first_usage<'tcx>(
         })
 }
 
-fn local_snippet_without_semicolon(cx: &LateContext<'_>, local: &Local<'_>) -> Option<String> {
+fn local_snippet_without_semicolon(cx: &LateContext<'_>, local: &LetStmt<'_>) -> Option<SourceText> {
     let span = local.span.with_hi(match local.ty {
         // let <pat>: <ty>;
         // ~~~~~~~~~~~~~~~
@@ -251,12 +250,12 @@ fn local_snippet_without_semicolon(cx: &LateContext<'_>, local: &Local<'_>) -> O
         None => local.pat.span.hi(),
     });
 
-    snippet_opt(cx, span)
+    span.get_source_text(cx)
 }
 
 fn check<'tcx>(
     cx: &LateContext<'tcx>,
-    local: &'tcx Local<'tcx>,
+    local: &'tcx LetStmt<'tcx>,
     local_stmt: &'tcx Stmt<'tcx>,
     block: &'tcx Block<'tcx>,
     binding_id: HirId,
@@ -278,24 +277,19 @@ fn check<'tcx>(
                 msg_span,
                 "unneeded late initialization",
                 |diag| {
-                    diag.tool_only_span_suggestion(
-                        local_stmt.span,
-                        "remove the local",
-                        "",
-                        Applicability::MachineApplicable,
-                    );
-
-                    diag.span_suggestion(
-                        assign.lhs_span,
-                        &format!("declare `{}` here", binding_name),
-                        let_snippet,
+                    diag.multipart_suggestion(
+                        format!("move the declaration `{binding_name}` here"),
+                        vec![
+                            (local_stmt.span, String::new()),
+                            (assign.lhs_span, let_snippet.to_owned()),
+                        ],
                         Applicability::MachineApplicable,
                     );
                 },
             );
         },
         ExprKind::If(cond, then_expr, Some(else_expr)) if !contains_let(cond) => {
-            let (applicability, suggestions) = assignment_suggestions(cx, binding_id, [then_expr, else_expr])?;
+            let (applicability, mut suggestions) = assignment_suggestions(cx, binding_id, [then_expr, else_expr])?;
 
             span_lint_and_then(
                 cx,
@@ -303,30 +297,26 @@ fn check<'tcx>(
                 local_stmt.span,
                 "unneeded late initialization",
                 |diag| {
-                    diag.tool_only_span_suggestion(local_stmt.span, "remove the local", String::new(), applicability);
-
-                    diag.span_suggestion_verbose(
-                        usage.stmt.span.shrink_to_lo(),
-                        &format!("declare `{}` here", binding_name),
-                        format!("{} = ", let_snippet),
-                        applicability,
-                    );
-
-                    diag.multipart_suggestion("remove the assignments from the branches", suggestions, applicability);
+                    suggestions.push((local_stmt.span, String::new()));
+                    suggestions.push((usage.stmt.span.shrink_to_lo(), format!("{let_snippet} = ")));
 
                     if usage.needs_semi {
-                        diag.span_suggestion(
-                            usage.stmt.span.shrink_to_hi(),
-                            "add a semicolon after the `if` expression",
-                            ";",
-                            applicability,
-                        );
+                        suggestions.push((usage.stmt.span.shrink_to_hi(), ";".to_owned()));
                     }
+
+                    diag.multipart_suggestion(
+                        format!(
+                            "move the declaration `{binding_name}` here and remove the assignments from the branches"
+                        ),
+                        suggestions,
+                        applicability,
+                    );
                 },
             );
         },
         ExprKind::Match(_, arms, MatchSource::Normal) => {
-            let (applicability, suggestions) = assignment_suggestions(cx, binding_id, arms.iter().map(|arm| arm.body))?;
+            let (applicability, mut suggestions) =
+                assignment_suggestions(cx, binding_id, arms.iter().map(|arm| arm.body))?;
 
             span_lint_and_then(
                 cx,
@@ -334,57 +324,44 @@ fn check<'tcx>(
                 local_stmt.span,
                 "unneeded late initialization",
                 |diag| {
-                    diag.tool_only_span_suggestion(local_stmt.span, "remove the local", String::new(), applicability);
+                    suggestions.push((local_stmt.span, String::new()));
+                    suggestions.push((usage.stmt.span.shrink_to_lo(), format!("{let_snippet} = ")));
 
-                    diag.span_suggestion_verbose(
-                        usage.stmt.span.shrink_to_lo(),
-                        &format!("declare `{}` here", binding_name),
-                        format!("{} = ", let_snippet),
-                        applicability,
-                    );
+                    if usage.needs_semi {
+                        suggestions.push((usage.stmt.span.shrink_to_hi(), ";".to_owned()));
+                    }
 
                     diag.multipart_suggestion(
-                        "remove the assignments from the `match` arms",
+                        format!("move the declaration `{binding_name}` here and remove the assignments from the `match` arms"),
                         suggestions,
                         applicability,
                     );
-
-                    if usage.needs_semi {
-                        diag.span_suggestion(
-                            usage.stmt.span.shrink_to_hi(),
-                            "add a semicolon after the `match` expression",
-                            ";",
-                            applicability,
-                        );
-                    }
                 },
             );
         },
         _ => {},
-    };
+    }
 
     Some(())
 }
 
 impl<'tcx> LateLintPass<'tcx> for NeedlessLateInit {
-    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx Local<'tcx>) {
+    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx LetStmt<'tcx>) {
         let mut parents = cx.tcx.hir().parent_iter(local.hir_id);
-        if_chain! {
-            if let Local {
-                init: None,
-                pat: &Pat {
-                    kind: PatKind::Binding(BindingAnnotation::Unannotated, binding_id, _, None),
+        if let LetStmt {
+            init: None,
+            pat:
+                Pat {
+                    kind: PatKind::Binding(BindingMode::NONE, binding_id, _, None),
                     ..
                 },
-                source: LocalSource::Normal,
-                ..
-            } = local;
-            if let Some((_, Node::Stmt(local_stmt))) = parents.next();
-            if let Some((_, Node::Block(block))) = parents.next();
-
-            then {
-                check(cx, local, local_stmt, block, binding_id);
-            }
+            source: LocalSource::Normal,
+            ..
+        } = local
+            && let Some((_, Node::Stmt(local_stmt))) = parents.next()
+            && let Some((_, Node::Block(block))) = parents.next()
+        {
+            check(cx, local, local_stmt, block, *binding_id);
         }
     }
 }

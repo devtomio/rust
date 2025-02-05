@@ -1,9 +1,14 @@
-// run-rustfix
+#![allow(
+    unused,
+    non_local_definitions,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_mut_passed,
+    clippy::unnecessary_to_owned,
+    clippy::unnecessary_literal_unwrap,
+    clippy::needless_lifetimes
+)]
+#![warn(clippy::needless_borrow)]
 
-#![feature(lint_reasons)]
-
-#[warn(clippy::all, clippy::needless_borrow)]
-#[allow(unused_variables, clippy::unnecessary_mut_passed)]
 fn main() {
     let a = 5;
     let ref_a = &a;
@@ -127,6 +132,9 @@ fn main() {
             0
         }
     }
+
+    // issue #11786
+    let x: (&str,) = (&"",);
 }
 
 #[allow(clippy::needless_borrowed_reference)]
@@ -152,14 +160,12 @@ impl<'a> Trait for &'a str {}
 
 fn h(_: &dyn Trait) {}
 
-#[allow(dead_code)]
 fn check_expect_suppression() {
     let a = 5;
     #[expect(clippy::needless_borrow)]
     let _ = x(&&a);
 }
 
-#[allow(dead_code)]
 mod issue9160 {
     pub struct S<F> {
         f: F,
@@ -182,4 +188,74 @@ mod issue9160 {
             (&mut self.f)()
         }
     }
+}
+
+fn issue9383() {
+    // Should not lint because unions need explicit deref when accessing field
+    use std::mem::ManuallyDrop;
+
+    #[derive(Clone, Copy)]
+    struct Wrap<T>(T);
+    impl<T> core::ops::Deref for Wrap<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.0
+        }
+    }
+    impl<T> core::ops::DerefMut for Wrap<T> {
+        fn deref_mut(&mut self) -> &mut T {
+            &mut self.0
+        }
+    }
+
+    union U<T: Copy> {
+        u: T,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Foo {
+        x: u32,
+    }
+
+    unsafe {
+        let mut x = U {
+            u: ManuallyDrop::new(Foo { x: 0 }),
+        };
+        let _ = &mut (&mut x.u).x;
+        let _ = &mut (&mut { x.u }).x;
+        let _ = &mut ({ &mut x.u }).x;
+
+        let mut x = U {
+            u: Wrap(ManuallyDrop::new(Foo { x: 0 })),
+        };
+        let _ = &mut (&mut x.u).x;
+        let _ = &mut (&mut { x.u }).x;
+        let _ = &mut ({ &mut x.u }).x;
+
+        let mut x = U { u: Wrap(Foo { x: 0 }) };
+        let _ = &mut (&mut x.u).x;
+        let _ = &mut (&mut { x.u }).x;
+        let _ = &mut ({ &mut x.u }).x;
+    }
+}
+
+mod issue_10253 {
+    struct S;
+    trait X {
+        fn f<T>(&self);
+    }
+    impl X for &S {
+        fn f<T>(&self) {}
+    }
+    fn f() {
+        (&S).f::<()>();
+    }
+}
+
+fn issue_12268() {
+    let option = Some((&1,));
+    let x = (&1,);
+    option.unwrap_or((&x.0,));
+    //~^ ERROR: this expression creates a reference which is immediately dereferenced by the
+    // compiler
 }

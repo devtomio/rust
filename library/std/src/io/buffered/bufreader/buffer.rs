@@ -1,15 +1,16 @@
-///! An encapsulation of `BufReader`'s buffer management logic.
-///
-/// This module factors out the basic functionality of `BufReader` in order to protect two core
-/// invariants:
-/// * `filled` bytes of `buf` are always initialized
-/// * `pos` is always <= `filled`
-/// Since this module encapsulates the buffer management logic, we can ensure that the range
-/// `pos..filled` is always a valid index into the initialized region of the buffer. This means
-/// that user code which wants to do reads from a `BufReader` via `buffer` + `consume` can do so
-/// without encountering any runtime bounds checks.
+//! An encapsulation of `BufReader`'s buffer management logic.
+//!
+//! This module factors out the basic functionality of `BufReader` in order to protect two core
+//! invariants:
+//! * `filled` bytes of `buf` are always initialized
+//! * `pos` is always <= `filled`
+//! Since this module encapsulates the buffer management logic, we can ensure that the range
+//! `pos..filled` is always a valid index into the initialized region of the buffer. This means
+//! that user code which wants to do reads from a `BufReader` via `buffer` + `consume` can do so
+//! without encountering any runtime bounds checks.
+
 use crate::cmp;
-use crate::io::{self, Read, ReadBuf};
+use crate::io::{self, BorrowedBuf, ErrorKind, Read};
 use crate::mem::MaybeUninit;
 
 pub struct Buffer {
@@ -20,20 +21,36 @@ pub struct Buffer {
     // Each call to `fill_buf` sets `filled` to indicate how many bytes at the start of `buf` are
     // initialized with bytes from a read.
     filled: usize,
+    // This is the max number of bytes returned across all `fill_buf` calls. We track this so that we
+    // can accurately tell `read_buf` how many bytes of buf are initialized, to bypass as much of its
+    // defensive initialization as possible. Note that while this often the same as `filled`, it
+    // doesn't need to be. Calls to `fill_buf` are not required to actually fill the buffer, and
+    // omitting this is a huge perf regression for `Read` impls that do not.
+    initialized: usize,
 }
 
 impl Buffer {
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         let buf = Box::new_uninit_slice(capacity);
-        Self { buf, pos: 0, filled: 0 }
+        Self { buf, pos: 0, filled: 0, initialized: 0 }
+    }
+
+    #[inline]
+    pub fn try_with_capacity(capacity: usize) -> io::Result<Self> {
+        match Box::try_new_uninit_slice(capacity) {
+            Ok(buf) => Ok(Self { buf, pos: 0, filled: 0, initialized: 0 }),
+            Err(_) => {
+                Err(io::const_error!(ErrorKind::OutOfMemory, "failed to allocate read buffer"))
+            }
+        }
     }
 
     #[inline]
     pub fn buffer(&self) -> &[u8] {
         // SAFETY: self.pos and self.cap are valid, and self.cap => self.pos, and
         // that region is initialized because those are all invariants of this type.
-        unsafe { MaybeUninit::slice_assume_init_ref(self.buf.get_unchecked(self.pos..self.filled)) }
+        unsafe { self.buf.get_unchecked(self.pos..self.filled).assume_init_ref() }
     }
 
     #[inline]
@@ -49,6 +66,12 @@ impl Buffer {
     #[inline]
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    // This is only used by a test which asserts that the initialization-tracking is correct.
+    #[cfg(test)]
+    pub fn initialized(&self) -> usize {
+        self.initialized
     }
 
     #[inline]
@@ -84,6 +107,27 @@ impl Buffer {
         self.pos = self.pos.saturating_sub(amt);
     }
 
+    /// Read more bytes into the buffer without discarding any of its contents
+    pub fn read_more(&mut self, mut reader: impl Read) -> io::Result<usize> {
+        let mut buf = BorrowedBuf::from(&mut self.buf[self.pos..]);
+        let old_init = self.initialized - self.pos;
+        unsafe {
+            buf.set_init(old_init);
+        }
+        reader.read_buf(buf.unfilled())?;
+        self.filled += buf.len();
+        self.initialized += buf.init_len() - old_init;
+        Ok(buf.len())
+    }
+
+    /// Remove bytes that have already been read from the buffer.
+    pub fn backshift(&mut self) {
+        self.buf.copy_within(self.pos.., 0);
+        self.initialized -= self.pos;
+        self.filled -= self.pos;
+        self.pos = 0;
+    }
+
     #[inline]
     pub fn fill_buf(&mut self, mut reader: impl Read) -> io::Result<&[u8]> {
         // If we've reached the end of our internal buffer then we need to fetch
@@ -93,12 +137,19 @@ impl Buffer {
         if self.pos >= self.filled {
             debug_assert!(self.pos == self.filled);
 
-            let mut readbuf = ReadBuf::uninit(&mut self.buf);
+            let mut buf = BorrowedBuf::from(&mut *self.buf);
+            // SAFETY: `self.filled` bytes will always have been initialized.
+            unsafe {
+                buf.set_init(self.initialized);
+            }
 
-            reader.read_buf(&mut readbuf)?;
+            let result = reader.read_buf(buf.unfilled());
 
-            self.filled = readbuf.filled_len();
             self.pos = 0;
+            self.filled = buf.len();
+            self.initialized = buf.init_len();
+
+            result?;
         }
         Ok(self.buffer())
     }

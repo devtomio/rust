@@ -1,5 +1,4 @@
-// run-rustfix
-// aux-build:proc_macro_derive.rs
+//@aux-build:proc_macro_derive.rs
 
 #![warn(clippy::use_self)]
 #![allow(dead_code, unreachable_code)]
@@ -7,7 +6,9 @@
     clippy::should_implement_trait,
     clippy::upper_case_acronyms,
     clippy::from_over_into,
-    clippy::self_named_constructors
+    clippy::self_named_constructors,
+    clippy::needless_lifetimes,
+    clippy::missing_transmute_annotations
 )]
 
 #[macro_use]
@@ -54,6 +55,7 @@ mod better {
 }
 
 mod lifetimes {
+    #[derive(Clone, Copy)]
     struct Foo<'a> {
         foo_str: &'a str,
     }
@@ -69,10 +71,18 @@ mod lifetimes {
             Foo { foo_str: "foo" }
         }
 
-        // FIXME: the lint does not handle lifetimed struct
-        // `Self` should be applicable here
         fn clone(&self) -> Foo<'a> {
             Foo { foo_str: self.foo_str }
+        }
+
+        // Cannot replace with `Self` because the lifetime is not `'a`.
+        fn eq<'b>(&self, other: Foo<'b>) -> bool {
+            let x: Foo<'_> = other;
+            self.foo_str == other.foo_str
+        }
+
+        fn f(&self) -> Foo<'_> {
+            *self
         }
     }
 }
@@ -605,6 +615,55 @@ mod issue8845 {
         fn use_crate(&self) -> u8 {
             let crate::issue8845::Bar { x, .. } = self;
             *x
+        }
+    }
+}
+
+mod issue6902 {
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    pub enum Foo {
+        Bar = 1,
+    }
+}
+
+#[clippy::msrv = "1.36"]
+fn msrv_1_36() {
+    enum E {
+        A,
+    }
+
+    impl E {
+        fn foo(self) {
+            match self {
+                E::A => {},
+            }
+        }
+    }
+}
+
+#[clippy::msrv = "1.37"]
+fn msrv_1_37() {
+    enum E {
+        A,
+    }
+
+    impl E {
+        fn foo(self) {
+            match self {
+                E::A => {},
+            }
+        }
+    }
+}
+
+mod issue_10371 {
+    struct Val<const V: i32> {}
+
+    impl<const V: i32> From<Val<V>> for i32 {
+        fn from(_: Val<V>) -> Self {
+            todo!()
         }
     }
 }

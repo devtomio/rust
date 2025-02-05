@@ -3,6 +3,7 @@
 //! This module contains a set of macros which are exported from the standard
 //! library. Each macro is available for use when linking against the standard
 //! library.
+// ignore-tidy-dbg
 
 #[doc = include_str!("../../core/src/macros/panic.md")]
 #[macro_export]
@@ -27,16 +28,33 @@ macro_rules! panic {
 /// necessary to use [`io::stdout().flush()`][flush] to ensure the output is emitted
 /// immediately.
 ///
+/// The `print!` macro will lock the standard output on each call. If you call
+/// `print!` within a hot loop, this behavior may be the bottleneck of the loop.
+/// To avoid this, lock stdout with [`io::stdout().lock()`][lock]:
+/// ```
+/// use std::io::{stdout, Write};
+///
+/// let mut lock = stdout().lock();
+/// write!(lock, "hello world").unwrap();
+/// ```
+///
 /// Use `print!` only for the primary output of your program. Use
 /// [`eprint!`] instead to print error and progress messages.
+///
+/// See [the formatting documentation in `std::fmt`](../std/fmt/index.html)
+/// for details of the macro argument syntax.
 ///
 /// [flush]: crate::io::Write::flush
 /// [`println!`]: crate::println
 /// [`eprint!`]: crate::eprint
+/// [lock]: crate::io::Stdout
 ///
 /// # Panics
 ///
 /// Panics if writing to `io::stdout()` fails.
+///
+/// Writing to non-blocking stdout can cause an error, which will lead
+/// this macro to panic.
 ///
 /// # Examples
 ///
@@ -75,15 +93,32 @@ macro_rules! print {
 /// This macro uses the same syntax as [`format!`], but writes to the standard output instead.
 /// See [`std::fmt`] for more information.
 ///
+/// The `println!` macro will lock the standard output on each call. If you call
+/// `println!` within a hot loop, this behavior may be the bottleneck of the loop.
+/// To avoid this, lock stdout with [`io::stdout().lock()`][lock]:
+/// ```
+/// use std::io::{stdout, Write};
+///
+/// let mut lock = stdout().lock();
+/// writeln!(lock, "hello world").unwrap();
+/// ```
+///
 /// Use `println!` only for the primary output of your program. Use
 /// [`eprintln!`] instead to print error and progress messages.
 ///
+/// See [the formatting documentation in `std::fmt`](../std/fmt/index.html)
+/// for details of the macro argument syntax.
+///
 /// [`std::fmt`]: crate::fmt
 /// [`eprintln!`]: crate::eprintln
+/// [lock]: crate::io::Stdout
 ///
 /// # Panics
 ///
 /// Panics if writing to [`io::stdout`] fails.
+///
+/// Writing to non-blocking stdout can cause an error, which will lead
+/// this macro to panic.
 ///
 /// [`io::stdout`]: crate::io::stdout
 ///
@@ -93,6 +128,8 @@ macro_rules! print {
 /// println!(); // prints just a newline
 /// println!("hello there!");
 /// println!("format {} arguments", "some");
+/// let local_variable = "some";
+/// println!("format {local_variable} arguments");
 /// ```
 #[macro_export]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -119,9 +156,15 @@ macro_rules! println {
 /// [`io::stderr`]: crate::io::stderr
 /// [`io::stdout`]: crate::io::stdout
 ///
+/// See [the formatting documentation in `std::fmt`](../std/fmt/index.html)
+/// for details of the macro argument syntax.
+///
 /// # Panics
 ///
 /// Panics if writing to `io::stderr` fails.
+///
+/// Writing to non-blocking stderr can cause an error, which will lead
+/// this macro to panic.
 ///
 /// # Examples
 ///
@@ -147,6 +190,9 @@ macro_rules! eprint {
 /// Use `eprintln!` only for error and progress messages. Use `println!`
 /// instead for the primary output of your program.
 ///
+/// See [the formatting documentation in `std::fmt`](../std/fmt/index.html)
+/// for details of the macro argument syntax.
+///
 /// [`io::stderr`]: crate::io::stderr
 /// [`io::stdout`]: crate::io::stdout
 /// [`println!`]: crate::println
@@ -154,6 +200,9 @@ macro_rules! eprint {
 /// # Panics
 ///
 /// Panics if writing to `io::stderr` fails.
+///
+/// Writing to non-blocking stderr can cause an error, which will lead
+/// this macro to panic.
 ///
 /// # Examples
 ///
@@ -181,7 +230,7 @@ macro_rules! eprintln {
 /// ```rust
 /// let a = 2;
 /// let b = dbg!(a * 2) + 1;
-/// //      ^-- prints: [src/main.rs:2] a * 2 = 4
+/// //      ^-- prints: [src/main.rs:2:9] a * 2 = 4
 /// assert_eq!(b, 5);
 /// ```
 ///
@@ -232,7 +281,7 @@ macro_rules! eprintln {
 /// This prints to [stderr]:
 ///
 /// ```text,ignore
-/// [src/main.rs:4] n.checked_sub(4) = None
+/// [src/main.rs:2:22] n.checked_sub(4) = None
 /// ```
 ///
 /// Naive factorial implementation:
@@ -252,15 +301,15 @@ macro_rules! eprintln {
 /// This prints to [stderr]:
 ///
 /// ```text,ignore
-/// [src/main.rs:3] n <= 1 = false
-/// [src/main.rs:3] n <= 1 = false
-/// [src/main.rs:3] n <= 1 = false
-/// [src/main.rs:3] n <= 1 = true
-/// [src/main.rs:4] 1 = 1
-/// [src/main.rs:5] n * factorial(n - 1) = 2
-/// [src/main.rs:5] n * factorial(n - 1) = 6
-/// [src/main.rs:5] n * factorial(n - 1) = 24
-/// [src/main.rs:11] factorial(4) = 24
+/// [src/main.rs:2:8] n <= 1 = false
+/// [src/main.rs:2:8] n <= 1 = false
+/// [src/main.rs:2:8] n <= 1 = false
+/// [src/main.rs:2:8] n <= 1 = true
+/// [src/main.rs:3:9] 1 = 1
+/// [src/main.rs:7:9] n * factorial(n - 1) = 2
+/// [src/main.rs:7:9] n * factorial(n - 1) = 6
+/// [src/main.rs:7:9] n * factorial(n - 1) = 24
+/// [src/main.rs:9:1] factorial(4) = 24
 /// ```
 ///
 /// The `dbg!(..)` macro moves the input:
@@ -306,15 +355,15 @@ macro_rules! dbg {
     // `$val` expression could be a block (`{ .. }`), in which case the `eprintln!`
     // will be malformed.
     () => {
-        $crate::eprintln!("[{}:{}]", $crate::file!(), $crate::line!())
+        $crate::eprintln!("[{}:{}:{}]", $crate::file!(), $crate::line!(), $crate::column!())
     };
     ($val:expr $(,)?) => {
         // Use of `match` here is intentional because it affects the lifetimes
         // of temporaries - https://stackoverflow.com/a/48732525/1063961
         match $val {
             tmp => {
-                $crate::eprintln!("[{}:{}] {} = {:#?}",
-                    $crate::file!(), $crate::line!(), $crate::stringify!($val), &tmp);
+                $crate::eprintln!("[{}:{}:{}] {} = {:#?}",
+                    $crate::file!(), $crate::line!(), $crate::column!(), $crate::stringify!($val), &tmp);
                 tmp
             }
         }
@@ -322,12 +371,4 @@ macro_rules! dbg {
     ($($val:expr),+ $(,)?) => {
         ($($crate::dbg!($val)),+,)
     };
-}
-
-#[cfg(test)]
-macro_rules! assert_approx_eq {
-    ($a:expr, $b:expr) => {{
-        let (a, b) = (&$a, &$b);
-        assert!((*a - *b).abs() < 1.0e-6, "{} is not approximately equal to {}", *a, *b);
-    }};
 }

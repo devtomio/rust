@@ -1,225 +1,234 @@
 #![deny(unused_must_use)]
 
-use crate::diagnostics::diagnostic_builder::{DiagnosticDeriveBuilder, DiagnosticDeriveKind};
-use crate::diagnostics::error::{span_err, DiagnosticDeriveError};
-use crate::diagnostics::utils::{build_field_mapping, SetOnce};
+use std::cell::RefCell;
+
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::spanned::Spanned;
 use synstructure::Structure;
 
-/// The central struct for constructing the `into_diagnostic` method from an annotated struct.
-pub(crate) struct SessionDiagnosticDerive<'a> {
+use crate::diagnostics::diagnostic_builder::DiagnosticDeriveKind;
+use crate::diagnostics::error::{DiagnosticDeriveError, span_err};
+use crate::diagnostics::utils::SetOnce;
+
+/// The central struct for constructing the `into_diag` method from an annotated struct.
+pub(crate) struct DiagnosticDerive<'a> {
     structure: Structure<'a>,
-    sess: syn::Ident,
-    builder: DiagnosticDeriveBuilder,
 }
 
-impl<'a> SessionDiagnosticDerive<'a> {
-    pub(crate) fn new(diag: syn::Ident, sess: syn::Ident, structure: Structure<'a>) -> Self {
-        Self {
-            builder: DiagnosticDeriveBuilder {
-                diag,
-                fields: build_field_mapping(&structure),
-                kind: None,
-                code: None,
-                slug: None,
-            },
-            sess,
-            structure,
-        }
+impl<'a> DiagnosticDerive<'a> {
+    pub(crate) fn new(structure: Structure<'a>) -> Self {
+        Self { structure }
     }
 
     pub(crate) fn into_tokens(self) -> TokenStream {
-        let SessionDiagnosticDerive { mut structure, sess, mut builder } = self;
+        let DiagnosticDerive { mut structure } = self;
+        let kind = DiagnosticDeriveKind::Diagnostic;
+        let slugs = RefCell::new(Vec::new());
+        let implementation = kind.each_variant(&mut structure, |mut builder, variant| {
+            let preamble = builder.preamble(variant);
+            let body = builder.body(variant);
 
-        let ast = structure.ast();
-        let (implementation, param_ty) = {
-            if let syn::Data::Struct(..) = ast.data {
-                let preamble = builder.preamble(&structure);
-                let (attrs, args) = builder.body(&mut structure);
+            let init = match builder.slug.value_ref() {
+                None => {
+                    span_err(builder.span, "diagnostic slug not specified")
+                        .help(
+                            "specify the slug as the first argument to the `#[diag(...)]` \
+                            attribute, such as `#[diag(hir_analysis_example_error)]`",
+                        )
+                        .emit();
+                    return DiagnosticDeriveError::ErrorHandled.to_compile_error();
+                }
+                Some(slug)
+                    if let Some(Mismatch { slug_name, crate_name, slug_prefix }) =
+                        Mismatch::check(slug) =>
+                {
+                    span_err(slug.span().unwrap(), "diagnostic slug and crate name do not match")
+                        .note(format!("slug is `{slug_name}` but the crate name is `{crate_name}`"))
+                        .help(format!("expected a slug starting with `{slug_prefix}_...`"))
+                        .emit();
+                    return DiagnosticDeriveError::ErrorHandled.to_compile_error();
+                }
+                Some(slug) => {
+                    slugs.borrow_mut().push(slug.clone());
+                    quote! {
+                        let mut diag = rustc_errors::Diag::new(
+                            dcx,
+                            level,
+                            crate::fluent_generated::#slug
+                        );
+                    }
+                }
+            };
 
-                let span = ast.span().unwrap();
-                let diag = &builder.diag;
-                let init = match (builder.kind.value(), builder.slug.value()) {
-                    (None, _) => {
-                        span_err(span, "diagnostic kind not specified")
-                            .help("use the `#[error(...)]` attribute to create an error")
-                            .emit();
-                        return DiagnosticDeriveError::ErrorHandled.to_compile_error();
-                    }
-                    (Some(kind), None) => {
-                        span_err(span, "diagnostic slug not specified")
-                            .help(&format!(
-                                "specify the slug as the first argument to the attribute, such as \
-                                 `#[{}(typeck::example_error)]`",
-                                kind.descr()
-                            ))
-                            .emit();
-                        return DiagnosticDeriveError::ErrorHandled.to_compile_error();
-                    }
-                    (Some(DiagnosticDeriveKind::Lint), _) => {
-                        span_err(span, "only `#[error(..)]` and `#[warning(..)]` are supported")
-                            .help("use the `#[error(...)]` attribute to create a error")
-                            .emit();
-                        return DiagnosticDeriveError::ErrorHandled.to_compile_error();
-                    }
-                    (Some(DiagnosticDeriveKind::Error), Some(slug)) => {
-                        quote! {
-                            let mut #diag = #sess.struct_err(rustc_errors::fluent::#slug);
-                        }
-                    }
-                    (Some(DiagnosticDeriveKind::Warn), Some(slug)) => {
-                        quote! {
-                            let mut #diag = #sess.struct_warn(rustc_errors::fluent::#slug);
-                        }
-                    }
-                };
-
-                let implementation = quote! {
-                    #init
-                    #preamble
-                    match self {
-                        #attrs
-                    }
-                    match self {
-                        #args
-                    }
-                    #diag
-                };
-                let param_ty = match builder.kind {
-                    Some((DiagnosticDeriveKind::Error, _)) => {
-                        quote! { rustc_errors::ErrorGuaranteed }
-                    }
-                    Some((DiagnosticDeriveKind::Lint | DiagnosticDeriveKind::Warn, _)) => {
-                        quote! { () }
-                    }
-                    _ => unreachable!(),
-                };
-
-                (implementation, param_ty)
-            } else {
-                span_err(
-                    ast.span().unwrap(),
-                    "`#[derive(SessionDiagnostic)]` can only be used on structs",
-                )
-                .emit();
-
-                let implementation = DiagnosticDeriveError::ErrorHandled.to_compile_error();
-                let param_ty = quote! { rustc_errors::ErrorGuaranteed };
-                (implementation, param_ty)
+            let formatting_init = &builder.formatting_init;
+            quote! {
+                #init
+                #formatting_init
+                #preamble
+                #body
+                diag
             }
-        };
+        });
 
-        structure.gen_impl(quote! {
-            gen impl<'__session_diagnostic_sess> rustc_session::SessionDiagnostic<'__session_diagnostic_sess, #param_ty>
-                    for @Self
+        // A lifetime of `'a` causes conflicts, but `_sess` is fine.
+        // FIXME(edition_2024): Fix the `keyword_idents_2024` lint to not trigger here?
+        #[allow(keyword_idents_2024)]
+        let mut imp = structure.gen_impl(quote! {
+            gen impl<'_sess, G> rustc_errors::Diagnostic<'_sess, G> for @Self
+                where G: rustc_errors::EmissionGuarantee
             {
-                fn into_diagnostic(
+                #[track_caller]
+                fn into_diag(
                     self,
-                    #sess: &'__session_diagnostic_sess rustc_session::parse::ParseSess
-                ) -> rustc_errors::DiagnosticBuilder<'__session_diagnostic_sess, #param_ty> {
-                    use rustc_errors::IntoDiagnosticArg;
+                    dcx: rustc_errors::DiagCtxtHandle<'_sess>,
+                    level: rustc_errors::Level
+                ) -> rustc_errors::Diag<'_sess, G> {
                     #implementation
                 }
             }
-        })
+        });
+        for test in slugs.borrow().iter().map(|s| generate_test(s, &structure)) {
+            imp.extend(test);
+        }
+        imp
     }
 }
 
 /// The central struct for constructing the `decorate_lint` method from an annotated struct.
 pub(crate) struct LintDiagnosticDerive<'a> {
     structure: Structure<'a>,
-    builder: DiagnosticDeriveBuilder,
 }
 
 impl<'a> LintDiagnosticDerive<'a> {
-    pub(crate) fn new(diag: syn::Ident, structure: Structure<'a>) -> Self {
-        Self {
-            builder: DiagnosticDeriveBuilder {
-                diag,
-                fields: build_field_mapping(&structure),
-                kind: None,
-                code: None,
-                slug: None,
-            },
-            structure,
-        }
+    pub(crate) fn new(structure: Structure<'a>) -> Self {
+        Self { structure }
     }
 
     pub(crate) fn into_tokens(self) -> TokenStream {
-        let LintDiagnosticDerive { mut structure, mut builder } = self;
+        let LintDiagnosticDerive { mut structure } = self;
+        let kind = DiagnosticDeriveKind::LintDiagnostic;
+        let slugs = RefCell::new(Vec::new());
+        let implementation = kind.each_variant(&mut structure, |mut builder, variant| {
+            let preamble = builder.preamble(variant);
+            let body = builder.body(variant);
 
-        let ast = structure.ast();
-        let implementation = {
-            if let syn::Data::Struct(..) = ast.data {
-                let preamble = builder.preamble(&structure);
-                let (attrs, args) = builder.body(&mut structure);
+            let primary_message = match builder.slug.value_ref() {
+                None => {
+                    span_err(builder.span, "diagnostic slug not specified")
+                        .help(
+                            "specify the slug as the first argument to the attribute, such as \
+                            `#[diag(compiletest_example)]`",
+                        )
+                        .emit();
+                    DiagnosticDeriveError::ErrorHandled.to_compile_error()
+                }
+                Some(slug)
+                    if let Some(Mismatch { slug_name, crate_name, slug_prefix }) =
+                        Mismatch::check(slug) =>
+                {
+                    span_err(slug.span().unwrap(), "diagnostic slug and crate name do not match")
+                        .note(format!("slug is `{slug_name}` but the crate name is `{crate_name}`"))
+                        .help(format!("expected a slug starting with `{slug_prefix}_...`"))
+                        .emit();
+                    DiagnosticDeriveError::ErrorHandled.to_compile_error()
+                }
+                Some(slug) => {
+                    slugs.borrow_mut().push(slug.clone());
+                    quote! {
+                        diag.primary_message(crate::fluent_generated::#slug);
+                    }
+                }
+            };
 
-                let diag = &builder.diag;
-                let span = ast.span().unwrap();
-                let init = match (builder.kind.value(), builder.slug.value()) {
-                    (None, _) => {
-                        span_err(span, "diagnostic kind not specified")
-                            .help("use the `#[error(...)]` attribute to create an error")
-                            .emit();
-                        return DiagnosticDeriveError::ErrorHandled.to_compile_error();
-                    }
-                    (Some(kind), None) => {
-                        span_err(span, "diagnostic slug not specified")
-                            .help(&format!(
-                                "specify the slug as the first argument to the attribute, such as \
-                                 `#[{}(typeck::example_error)]`",
-                                kind.descr()
-                            ))
-                            .emit();
-                        return DiagnosticDeriveError::ErrorHandled.to_compile_error();
-                    }
-                    (Some(DiagnosticDeriveKind::Error | DiagnosticDeriveKind::Warn), _) => {
-                        span_err(span, "only `#[lint(..)]` is supported")
-                            .help("use the `#[lint(...)]` attribute to create a lint")
-                            .emit();
-                        return DiagnosticDeriveError::ErrorHandled.to_compile_error();
-                    }
-                    (Some(DiagnosticDeriveKind::Lint), Some(slug)) => {
-                        quote! {
-                            let mut #diag = #diag.build(rustc_errors::fluent::#slug);
-                        }
-                    }
-                };
-
-                let implementation = quote! {
-                    #init
-                    #preamble
-                    match self {
-                        #attrs
-                    }
-                    match self {
-                        #args
-                    }
-                    #diag.emit();
-                };
-
-                implementation
-            } else {
-                span_err(
-                    ast.span().unwrap(),
-                    "`#[derive(LintDiagnostic)]` can only be used on structs",
-                )
-                .emit();
-
-                DiagnosticDeriveError::ErrorHandled.to_compile_error()
+            let formatting_init = &builder.formatting_init;
+            quote! {
+                #primary_message
+                #preamble
+                #formatting_init
+                #body
+                diag
             }
-        };
+        });
 
-        let diag = &builder.diag;
-        structure.gen_impl(quote! {
-            gen impl<'__a> rustc_errors::DecorateLint<'__a, ()> for @Self {
-                fn decorate_lint(self, #diag: rustc_errors::LintDiagnosticBuilder<'__a, ()>) {
-                    use rustc_errors::IntoDiagnosticArg;
-                    #implementation
+        // FIXME(edition_2024): Fix the `keyword_idents_2024` lint to not trigger here?
+        #[allow(keyword_idents_2024)]
+        let mut imp = structure.gen_impl(quote! {
+            gen impl<'__a> rustc_errors::LintDiagnostic<'__a, ()> for @Self {
+                #[track_caller]
+                fn decorate_lint<'__b>(
+                    self,
+                    diag: &'__b mut rustc_errors::Diag<'__a, ()>
+                ) {
+                    #implementation;
                 }
             }
-        })
+        });
+        for test in slugs.borrow().iter().map(|s| generate_test(s, &structure)) {
+            imp.extend(test);
+        }
+
+        imp
+    }
+}
+
+struct Mismatch {
+    slug_name: String,
+    crate_name: String,
+    slug_prefix: String,
+}
+
+impl Mismatch {
+    /// Checks whether the slug starts with the crate name it's in.
+    fn check(slug: &syn::Path) -> Option<Mismatch> {
+        // If this is missing we're probably in a test, so bail.
+        let crate_name = std::env::var("CARGO_CRATE_NAME").ok()?;
+
+        // If we're not in a "rustc_" crate, bail.
+        let Some(("rustc", slug_prefix)) = crate_name.split_once('_') else { return None };
+
+        let slug_name = slug.segments.first()?.ident.to_string();
+        if !slug_name.starts_with(slug_prefix) {
+            Some(Mismatch { slug_name, slug_prefix: slug_prefix.to_string(), crate_name })
+        } else {
+            None
+        }
+    }
+}
+
+/// Generates a `#[test]` that verifies that all referenced variables
+/// exist on this structure.
+fn generate_test(slug: &syn::Path, structure: &Structure<'_>) -> TokenStream {
+    // FIXME: We can't identify variables in a subdiagnostic
+    for field in structure.variants().iter().flat_map(|v| v.ast().fields.iter()) {
+        for attr_name in field.attrs.iter().filter_map(|at| at.path().get_ident()) {
+            if attr_name == "subdiagnostic" {
+                return quote!();
+            }
+        }
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // We need to make sure that the same diagnostic slug can be used multiple times without
+    // causing an error, so just have a global counter here.
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let slug = slug.get_ident().unwrap();
+    let ident = quote::format_ident!("verify_{slug}_{}", COUNTER.fetch_add(1, Ordering::Relaxed));
+    let ref_slug = quote::format_ident!("{slug}_refs");
+    let struct_name = &structure.ast().ident;
+    let variables: Vec<_> = structure
+        .variants()
+        .iter()
+        .flat_map(|v| v.ast().fields.iter().filter_map(|f| f.ident.as_ref().map(|i| i.to_string())))
+        .collect();
+    // tidy errors on `#[test]` outside of test files, so we use `#[test ]` to work around this
+    quote! {
+        #[cfg(test)]
+        #[test ]
+        fn #ident() {
+            let variables = [#(#variables),*];
+            for vref in crate::fluent_generated::#ref_slug {
+                assert!(variables.contains(vref), "{}: variable `{vref}` not found ({})", stringify!(#struct_name), stringify!(#slug));
+            }
+        }
     }
 }
